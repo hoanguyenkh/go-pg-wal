@@ -1,10 +1,12 @@
 package walreader
 
 import (
+	"strings"
 	"time"
 
 	"github.com/KyberNetwork/kutils/cache"
 	"github.com/hoanguyenkh/go-pg-wal/pkg/state"
+	"github.com/hoanguyenkh/go-pg-wal/pkg/utils"
 )
 
 // Config holds configuration for the WAL reader
@@ -32,10 +34,17 @@ type Config struct {
 
 	// Plugin arguments (default: proto_version '1')
 	PluginArgs []string
+
+	Schema       string
+	MapTableName map[string]bool
 }
 
 // NewConfig creates a new config with default values
-func NewConfig(connString, slotName, publicationName string) *Config {
+func NewConfig(connString, slotName, publicationName, schema, tables string) *Config {
+	mapTableName := map[string]bool{}
+	for _, table := range strings.Split(tables, ",") {
+		mapTableName[table] = true
+	}
 	return &Config{
 		ConnString:            connString,
 		SlotName:              slotName,
@@ -44,7 +53,22 @@ func NewConfig(connString, slotName, publicationName string) *Config {
 		LSNStateFile:          "wal_sync_state.lsn",
 		StandbyMessageTimeout: 10 * time.Second,
 		PluginArgs:            []string{"proto_version '1'"},
+		Schema:                schema,
+		MapTableName:          mapTableName,
 	}
+}
+
+func (c *Config) IsWhiteListTable(schema, table string) bool {
+	if c.Schema != schema {
+		return false
+	}
+	if table == utils.WalLsnState {
+		return false
+	}
+	if len(c.MapTableName) == 0 {
+		return true
+	}
+	return c.MapTableName[table]
 }
 
 // WithFileStore sets the config to use file-based LSN storage

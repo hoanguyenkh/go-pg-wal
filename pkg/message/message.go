@@ -44,6 +44,12 @@ func New(data []byte, serverTime time.Time, relation map[uint32]*format.Relation
 		return format.NewUpdate(data, streamedTransaction, relation, serverTime)
 	case DeleteByte:
 		return format.NewDelete(data, streamedTransaction, relation, serverTime)
+	case BeginByte:
+		// Begin transaction - return a special marker or nil
+		return "BEGIN_TRANSACTION", nil
+	case CommitByte:
+		// Commit transaction - return a special marker or nil
+		return "COMMIT_TRANSACTION", nil
 	case StreamStopByte, StreamAbortByte, StreamCommitByte:
 		streamedTransaction = false
 		return nil, nil
@@ -57,8 +63,8 @@ func New(data []byte, serverTime time.Time, relation map[uint32]*format.Relation
 		streamedTransaction = true
 		return nil, nil
 	default:
-		fmt.Println("hoank", string(data[0]))
-		// return nil, errors.Wrap(ErrorByteNotSupported, string(data[0]))
+		// Log unsupported message types for debugging
+		fmt.Printf("Unsupported message type: %c (0x%02x)\n", data[0], data[0])
 		return nil, nil
 	}
 }

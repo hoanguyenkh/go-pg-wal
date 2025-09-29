@@ -6,7 +6,6 @@ import (
 	"log"
 	"time"
 
-	"github.com/hoanguyenkh/go-pg-wal/pkg/utils"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -178,66 +177,69 @@ func (r *Reader) handleXLogData(data []byte) error {
 	}
 
 	// Process the logical message using pkg/message
-	err = r.handleLogicalMessage(xld.WALData, time.Now())
+	isSaveLsn, err := r.handleLogicalMessage(xld.WALData, time.Now())
 	if err != nil {
 		return fmt.Errorf("error processing logical message: %w", err)
 	}
 
 	// Update and save the latest LSN
 	r.lastLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
-
-	err = r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, r.lastLSN)
-	if err != nil {
-		return fmt.Errorf("CRITICAL: cannot save LSN state: %w", err)
+	if isSaveLsn {
+		err = r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, r.lastLSN)
+		if err != nil {
+			return fmt.Errorf("CRITICAL: cannot save LSN state: %w", err)
+		}
 	}
 	return nil
 }
 
 // handleLogicalMessage processes logical replication messages
-func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time) error {
+func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time) (bool, error) {
 	msg, err := message.New(data, serverTime, r.relations)
 	if err != nil {
 		// Ignore unsupported messages
 		if err.Error() == "message byte not supported" {
 			log.Printf("Unsupported message type: %c", data[0])
-			return nil
+			return false, nil
 		}
 		// Don't fail on parse errors, just log them
 		log.Printf("Warning: failed to parse message: %v", err)
-		return nil
+		return false, nil
 	}
 
 	if msg == nil {
 		// Some messages return nil (like stream control messages)
-		return nil
+		return false, nil
 	}
 
 	// Handle different message types
 	switch m := msg.(type) {
+	case string:
+		return false, nil
 	case *format.Relation:
-		if m.Name == utils.WalLsnState {
-			return nil
+		if !r.config.IsWhiteListTable(m.Namespace, m.Name) {
+			return false, nil
 		}
-		return r.handler.HandleRelation(m)
+		return true, r.handler.HandleRelation(m)
 	case *format.Insert:
-		if m.TableName == utils.WalLsnState {
-			return nil
+		if !r.config.IsWhiteListTable(m.TableNamespace, m.TableName) {
+			return false, nil
 		}
-		return r.handler.HandleInsert(m)
+		return true, r.handler.HandleInsert(m)
 	case *format.Update:
-		if m.TableName == utils.WalLsnState {
-			return nil
+		if !r.config.IsWhiteListTable(m.TableNamespace, m.TableName) {
+			return false, nil
 		}
-		return r.handler.HandleUpdate(m)
+		return true, r.handler.HandleUpdate(m)
 	case *format.Delete:
-		if m.TableName == utils.WalLsnState {
-			return nil
+		if !r.config.IsWhiteListTable(m.TableNamespace, m.TableName) {
+			return false, nil
 		}
-		return r.handler.HandleDelete(m)
+		return true, r.handler.HandleDelete(m)
 
 	default:
 		log.Printf("Unhandled message type: %T", m)
-		return nil
+		return false, nil
 	}
 }
 
