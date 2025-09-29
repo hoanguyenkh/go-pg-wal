@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/hoanguyenkh/go-pg-wal/pkg/utils"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -17,19 +18,27 @@ import (
 
 // Reader handles PostgreSQL WAL replication
 type Reader struct {
-	config    *Config
-	handler   MessageHandler
-	conn      *pgconn.PgConn
-	relations map[uint32]*format.Relation
-	lastLSN   pglogrepl.LSN
+	config     *Config
+	handler    MessageHandler
+	conn       *pgconn.PgConn
+	relations  map[uint32]*format.Relation
+	lastLSN    pglogrepl.LSN
+	stateStore state.IStateStore
 }
 
 // NewReader creates a new WAL reader
 func NewReader(config *Config, handler MessageHandler) *Reader {
+	// Use provided IStateStore or default to file store
+	stateStore := config.StateStore
+	if stateStore == nil {
+		stateStore = state.NewFileStore()
+	}
+
 	return &Reader{
-		config:    config,
-		handler:   handler,
-		relations: make(map[uint32]*format.Relation),
+		config:     config,
+		handler:    handler,
+		relations:  make(map[uint32]*format.Relation),
+		stateStore: stateStore,
 	}
 }
 
@@ -41,10 +50,11 @@ func (r *Reader) Connect(ctx context.Context) error {
 	}
 	r.conn = conn
 
-	// Load last LSN from state file
-	lastLSN, err := state.LoadLSNState(r.config.LSNStateFile)
+	// Load last LSN from state store
+	lastLSN, err := r.stateStore.LoadLSN(ctx, r.config.LSNStateKey)
 	if err != nil {
-		lastLSN = 0 // Start from beginning if no state file
+		lastLSN = 0 // Start from beginning if no state found
+		log.Printf("No previous LSN state found, starting from beginning: %v", err)
 	}
 	r.lastLSN = lastLSN
 
@@ -175,11 +185,11 @@ func (r *Reader) handleXLogData(data []byte) error {
 
 	// Update and save the latest LSN
 	r.lastLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
-	err = state.SaveLSNState(r.config.LSNStateFile, r.lastLSN)
+
+	err = r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, r.lastLSN)
 	if err != nil {
 		return fmt.Errorf("CRITICAL: cannot save LSN state: %w", err)
 	}
-
 	return nil
 }
 
@@ -205,15 +215,24 @@ func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time) error {
 	// Handle different message types
 	switch m := msg.(type) {
 	case *format.Relation:
+		if m.Name == utils.WalLsnState {
+			return nil
+		}
 		return r.handler.HandleRelation(m)
-
 	case *format.Insert:
+		if m.TableName == utils.WalLsnState {
+			return nil
+		}
 		return r.handler.HandleInsert(m)
-
 	case *format.Update:
+		if m.TableName == utils.WalLsnState {
+			return nil
+		}
 		return r.handler.HandleUpdate(m)
-
 	case *format.Delete:
+		if m.TableName == utils.WalLsnState {
+			return nil
+		}
 		return r.handler.HandleDelete(m)
 
 	default:
@@ -222,12 +241,28 @@ func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time) error {
 	}
 }
 
-// Close closes the connection
+// Close closes the connection and state store
 func (r *Reader) Close(ctx context.Context) error {
+	var err error
+
+	// Close PostgreSQL connection
 	if r.conn != nil {
-		return r.conn.Close(ctx)
+		if connErr := r.conn.Close(ctx); connErr != nil {
+			err = connErr
+		}
 	}
-	return nil
+
+	// Close state store
+	if r.stateStore != nil {
+		if storeErr := r.stateStore.Close(); storeErr != nil {
+			if err != nil {
+				return fmt.Errorf("multiple close errors - conn: %w, store: %v", err, storeErr)
+			}
+			err = storeErr
+		}
+	}
+
+	return err
 }
 
 // GetLastLSN returns the last processed LSN

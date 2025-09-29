@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/KyberNetwork/kutils/cache"
+	_ "github.com/jackc/pgx/v5/stdlib" // Import pgx driver for database/sql
+
 	"github.com/hoanguyenkh/go-pg-wal/pkg/message/format"
-	"github.com/hoanguyenkh/go-pg-wal/pkg/sql"
 	"github.com/hoanguyenkh/go-pg-wal/pkg/walreader"
 )
 
@@ -21,10 +24,34 @@ const (
 )
 
 func main() {
-	// Create configuration
-	config := walreader.NewConfig(PostgresConnStr, ReplicationSlotName, PublicationName)
-	config.LSNStateFile = LsnStateFile
+	// Parse command line flags
+	storageType := flag.String("storage", "redis", "Storage type for LSN state: file, redis, or db")
+	flag.Parse()
 
+	log.Printf("Using %s storage for LSN state", *storageType)
+
+	// Run the appropriate example based on storage type
+	switch *storageType {
+	case "file":
+		FileExample()
+	case "redis":
+		RedisExample()
+	default:
+		log.Fatalf("Unknown storage type: %s. Use 'file', 'redis', or 'db'", *storageType)
+	}
+}
+
+// FileExample demonstrates file-based LSN storage (default)
+func FileExample() {
+	// Create configuration with file store (default)
+	config := walreader.NewConfig(PostgresConnStr, ReplicationSlotName, PublicationName)
+	config.WithFileStore(LsnStateFile)
+
+	runWALReader(config, "file")
+}
+
+// runWALReader is the common WAL reader logic
+func runWALReader(config *walreader.Config, storageType string) {
 	// Create message handler
 	handler := &MySQLHandler{}
 
@@ -54,6 +81,8 @@ func main() {
 		log.Fatalf("Failed to start replication: %v", err)
 	}
 
+	log.Printf("Starting WAL replication with %s state storage...", storageType)
+
 	// Run the main replication loop
 	err = reader.Run(ctx)
 	if err != nil && !errors.Is(err, context.Canceled) {
@@ -70,40 +99,14 @@ type MySQLHandler struct {
 
 // HandleInsert processes INSERT messages
 func (h *MySQLHandler) HandleInsert(msg *format.Insert) error {
-	query, args := sql.BuildInsertQuery(msg.TableName, msg.Decoded)
 	log.Printf("[INSERT] Table: %s", msg.TableName)
-	log.Printf("[INSERT] Query: %s", query)
-	log.Printf("[INSERT] Args: %v", args)
 	log.Printf("[INSERT] Data: %+v\n", msg.Decoded)
 	return nil
 }
 
 // HandleUpdate processes UPDATE messages
 func (h *MySQLHandler) HandleUpdate(msg *format.Update) error {
-	// Simple assumption: first column is the primary key.
-	// IMPORTANT: For production code, determine the primary key by checking
-	// the 'ColumnFlagKey' flag in the relation columns.
-	var pkColumn string
-	var pkValue interface{}
-
-	// Find the first non-nil value in old data as PK
-	for k, v := range msg.OldDecoded {
-		if v != nil {
-			pkColumn = k
-			pkValue = v
-			break
-		}
-	}
-
-	if pkColumn == "" {
-		log.Printf("[UPDATE] Warning: no primary key found for table %s", msg.TableName)
-		return nil
-	}
-
-	query, args := sql.BuildUpdateQuery(msg.TableName, msg.NewDecoded, pkColumn, pkValue)
 	log.Printf("[UPDATE] Table: %s", msg.TableName)
-	log.Printf("[UPDATE] Query: %s", query)
-	log.Printf("[UPDATE] Args: %v", args)
 	log.Printf("[UPDATE] Old Data: %+v", msg.OldDecoded)
 	log.Printf("[UPDATE] New Data: %+v\n", msg.NewDecoded)
 	return nil
@@ -111,28 +114,7 @@ func (h *MySQLHandler) HandleUpdate(msg *format.Update) error {
 
 // HandleDelete processes DELETE messages
 func (h *MySQLHandler) HandleDelete(msg *format.Delete) error {
-	// Simple assumption: first column is the primary key.
-	var pkColumn string
-	var pkValue interface{}
-
-	// Find the first non-nil value as PK
-	for k, v := range msg.OldDecoded {
-		if v != nil {
-			pkColumn = k
-			pkValue = v
-			break
-		}
-	}
-
-	if pkColumn == "" {
-		log.Printf("[DELETE] Warning: no primary key found for table %s", msg.TableName)
-		return nil
-	}
-
-	query, args := sql.BuildDeleteQuery(msg.TableName, pkColumn, pkValue)
 	log.Printf("[DELETE] Table: %s", msg.TableName)
-	log.Printf("[DELETE] Query: %s", query)
-	log.Printf("[DELETE] Args: %v", args)
 	log.Printf("[DELETE] Data: %+v\n", msg.OldDecoded)
 	return nil
 }
@@ -153,4 +135,11 @@ func (h *MySQLHandler) HandleBeginTransaction() error {
 func (h *MySQLHandler) HandleCommitTransaction() error {
 	log.Println("=== End transaction ===")
 	return nil
+}
+
+func RedisExample() {
+	redisCache := cache.NewRedisCache(&cache.RedisConfig{})
+	config := walreader.NewConfig(PostgresConnStr, ReplicationSlotName, PublicationName)
+	config.WithRedisStore(redisCache)
+	runWALReader(config, "database")
 }

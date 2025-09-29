@@ -57,7 +57,8 @@ func New(data []byte, serverTime time.Time, relation map[uint32]*format.Relation
 		streamedTransaction = true
 		return nil, nil
 	default:
-		fmt.Println(string(data[0]))
-		return nil, errors.Wrap(ErrorByteNotSupported, string(data[0]))
+		fmt.Println("hoank", string(data[0]))
+		// return nil, errors.Wrap(ErrorByteNotSupported, string(data[0]))
+		return nil, nil
 	}
 }
