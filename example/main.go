@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/KyberNetwork/kutils/cache"
 	"github.com/hoanguyenkh/go-pg-wal/pkg/state"
@@ -28,9 +29,16 @@ const (
 func main() {
 	// Parse command line flags
 	storageType := flag.String("storage", "db", "Storage type for LSN state: file, redis, or db")
+	useBatch := flag.Bool("batch", false, "Enable batch processing mode")
 	flag.Parse()
 
 	log.Printf("Using %s storage for LSN state", *storageType)
+
+	if *useBatch {
+		log.Println("Batch processing mode enabled")
+		BatchExample()
+		return
+	}
 
 	// Run the appropriate example based on storage type
 	switch *storageType {
@@ -224,4 +232,107 @@ func DBExample() {
 	}
 
 	log.Println("Application stopped.")
+}
+
+// BatchExample demonstrates batch processing mode
+func BatchExample() {
+	// Create configuration with batch processing enabled
+	config := walreader.NewConfig(PostgresConnStr, ReplicationSlotName, PublicationName,
+		"public",
+		"pool_positions,pool_state_dbs")
+	config.WithFileStore(LsnStateFile)
+
+	// Configure batch processing
+	config.BatchSize = 100                // Process 100 messages at a time
+	config.BatchTimeout = 5 * time.Second // Or flush after 5 seconds
+
+	// Create batch message handler
+	handler := &BatchHandler{}
+
+	// Create WAL reader
+	reader := walreader.NewReader(config, handler)
+
+	// Handle shutdown signals
+	ctx, cancel := context.WithCancel(context.Background())
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-c
+		log.Println("Received stop signal, shutting down...")
+		cancel()
+	}()
+
+	// Connect to PostgreSQL
+	err := reader.Connect(ctx)
+	if err != nil {
+		log.Fatalf("Failed to connect: %v", err)
+	}
+	defer reader.Close(ctx)
+
+	// Start replication
+	err = reader.StartReplication(ctx)
+	if err != nil {
+		log.Fatalf("Failed to start replication: %v", err)
+	}
+
+	log.Println("Starting WAL replication with batch processing...")
+
+	// Run the main replication loop
+	err = reader.Run(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		log.Fatalf("Replication error: %v", err)
+	}
+
+	log.Println("Application stopped.")
+}
+
+// BatchHandler implements walreader.BatchMessageHandler for batch processing
+type BatchHandler struct {
+	walreader.DefaultHandler
+}
+
+// HandleBatch processes a batch of messages at once
+func (h *BatchHandler) HandleBatch(messages []walreader.BatchMessage) error {
+	log.Printf("Processing batch of %d messages", len(messages))
+
+	// Count message types
+	inserts := 0
+	updates := 0
+	deletes := 0
+	relations := 0
+
+	for _, msg := range messages {
+		switch msg.Type {
+		case "insert":
+			inserts++
+			// Process insert in batch
+			// e.g., collect all inserts and do bulk insert to target database
+			log.Printf("  [INSERT] Table: %s, Data: %+v", msg.Insert.TableName, msg.Insert.Decoded)
+
+		case "update":
+			updates++
+			// Process update in batch
+			log.Printf("  [UPDATE] Table: %s, New: %+v", msg.Update.TableName, msg.Update.NewDecoded)
+
+		case "delete":
+			deletes++
+			// Process delete in batch
+			log.Printf("  [DELETE] Table: %s, Data: %+v", msg.Delete.TableName, msg.Delete.OldDecoded)
+
+		case "relation":
+			relations++
+			log.Printf("  [RELATION] Table: %s.%s", msg.Relation.Namespace, msg.Relation.Name)
+		}
+	}
+
+	log.Printf("Batch summary: %d inserts, %d updates, %d deletes, %d relations",
+		inserts, updates, deletes, relations)
+
+	// Here you can do bulk operations like:
+	// - Bulk insert to database
+	// - Bulk update using transaction
+	// - Send batch to message queue
+	// - etc.
+
+	return nil
 }

@@ -18,12 +18,17 @@ import (
 
 // Reader handles PostgreSQL WAL replication
 type Reader struct {
-	config     *Config
-	handler    MessageHandler
-	conn       *pgconn.PgConn
-	relations  map[uint32]*format.Relation
-	lastLSN    pglogrepl.LSN
-	stateStore state.IStateStore
+	config       *Config
+	handler      MessageHandler
+	batchHandler BatchMessageHandler // If handler supports batching
+	conn         *pgconn.PgConn
+	relations    map[uint32]*format.Relation
+	lastLSN      pglogrepl.LSN
+	stateStore   state.IStateStore
+
+	// Batch processing
+	messageBatch   []BatchMessage
+	lastBatchFlush time.Time
 }
 
 // NewReader creates a new WAL reader
@@ -34,12 +39,22 @@ func NewReader(config *Config, handler MessageHandler) *Reader {
 		stateStore = state.NewFileStore()
 	}
 
-	return &Reader{
-		config:     config,
-		handler:    handler,
-		relations:  make(map[uint32]*format.Relation),
-		stateStore: stateStore,
+	reader := &Reader{
+		config:         config,
+		handler:        handler,
+		relations:      make(map[uint32]*format.Relation),
+		stateStore:     stateStore,
+		messageBatch:   make([]BatchMessage, 0, config.BatchSize),
+		lastBatchFlush: time.Now(),
 	}
+
+	// Check if handler supports batch processing
+	if batchHandler, ok := handler.(BatchMessageHandler); ok {
+		reader.batchHandler = batchHandler
+		log.Printf("Batch processing enabled: size=%d, timeout=%v", config.BatchSize, config.BatchTimeout)
+	}
+
+	return reader
 }
 
 // Connect establishes connection to PostgreSQL
@@ -351,9 +366,20 @@ func (r *Reader) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Flush any remaining batched messages before stopping
+			if err := r.flushBatch(ctx); err != nil {
+				log.Printf("Error flushing batch on shutdown: %v", err)
+			}
 			log.Println("Replication stopped by context")
 			return ctx.Err()
 		default:
+		}
+
+		// Check if batch timeout has been reached
+		if r.shouldFlushBatch() {
+			if err := r.flushBatch(ctx); err != nil {
+				return fmt.Errorf("error flushing batch: %w", err)
+			}
 		}
 
 		// Send standby status to keep connection alive
@@ -481,22 +507,22 @@ func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time) (bool, 
 		if !r.config.IsWhiteListTable(m.Namespace, m.Name) {
 			return false, nil
 		}
-		return true, r.handler.HandleRelation(m)
+		return r.handleMessage("relation", nil, nil, nil, m)
 	case *format.Insert:
 		if !r.config.IsWhiteListTable(m.TableNamespace, m.TableName) {
 			return false, nil
 		}
-		return true, r.handler.HandleInsert(m)
+		return r.handleMessage("insert", m, nil, nil, nil)
 	case *format.Update:
 		if !r.config.IsWhiteListTable(m.TableNamespace, m.TableName) {
 			return false, nil
 		}
-		return true, r.handler.HandleUpdate(m)
+		return r.handleMessage("update", nil, m, nil, nil)
 	case *format.Delete:
 		if !r.config.IsWhiteListTable(m.TableNamespace, m.TableName) {
 			return false, nil
 		}
-		return true, r.handler.HandleDelete(m)
+		return r.handleMessage("delete", nil, nil, m, nil)
 
 	default:
 		log.Printf("Unhandled message type: %T", m)
@@ -504,13 +530,105 @@ func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time) (bool, 
 	}
 }
 
+// handleMessage processes a message either in batch mode or single mode
+func (r *Reader) handleMessage(msgType string, insert *format.Insert, update *format.Update, delete *format.Delete, relation *format.Relation) (bool, error) {
+	// If batch processing is enabled and configured
+	if r.batchHandler != nil && r.config.BatchSize > 0 {
+		// Add to batch
+		r.messageBatch = append(r.messageBatch, BatchMessage{
+			Type:     msgType,
+			Insert:   insert,
+			Update:   update,
+			Delete:   delete,
+			Relation: relation,
+		})
+
+		// Check if batch is full
+		if len(r.messageBatch) >= r.config.BatchSize {
+			err := r.flushBatch(context.Background())
+			if err != nil {
+				return false, fmt.Errorf("error flushing full batch: %w", err)
+			}
+			return true, nil
+		}
+
+		// Don't save LSN yet, will save after batch flush
+		return false, nil
+	}
+
+	// Single message mode
+	var err error
+	switch msgType {
+	case "relation":
+		err = r.handler.HandleRelation(relation)
+	case "insert":
+		err = r.handler.HandleInsert(insert)
+	case "update":
+		err = r.handler.HandleUpdate(update)
+	case "delete":
+		err = r.handler.HandleDelete(delete)
+	}
+
+	return true, err
+}
+
+// shouldFlushBatch checks if the batch should be flushed based on timeout
+func (r *Reader) shouldFlushBatch() bool {
+	if r.batchHandler == nil || r.config.BatchSize == 0 {
+		return false
+	}
+
+	if len(r.messageBatch) == 0 {
+		return false
+	}
+
+	// Check if batch timeout has been reached
+	return time.Since(r.lastBatchFlush) >= r.config.BatchTimeout
+}
+
+// flushBatch processes all messages in the current batch
+func (r *Reader) flushBatch(ctx context.Context) error {
+	if len(r.messageBatch) == 0 {
+		return nil
+	}
+
+	log.Printf("Flushing batch with %d messages", len(r.messageBatch))
+
+	// Process the batch
+	err := r.batchHandler.HandleBatch(r.messageBatch)
+	if err != nil {
+		return fmt.Errorf("error handling batch: %w", err)
+	}
+
+	// Save LSN after successful batch processing
+	err = r.stateStore.SaveLSN(ctx, r.config.LSNStateKey, r.lastLSN)
+	if err != nil {
+		return fmt.Errorf("CRITICAL: cannot save LSN state after batch: %w", err)
+	}
+
+	// Clear the batch
+	r.messageBatch = r.messageBatch[:0]
+	r.lastBatchFlush = time.Now()
+
+	return nil
+}
+
 // Close closes the connection and state store
 func (r *Reader) Close(ctx context.Context) error {
 	var err error
 
+	// Flush any remaining batched messages
+	if flushErr := r.flushBatch(ctx); flushErr != nil {
+		log.Printf("Error flushing batch on close: %v", flushErr)
+		err = flushErr
+	}
+
 	// Close PostgreSQL connection
 	if r.conn != nil {
 		if connErr := r.conn.Close(ctx); connErr != nil {
+			if err != nil {
+				return fmt.Errorf("multiple close errors - flush: %w, conn: %v", err, connErr)
+			}
 			err = connErr
 		}
 	}

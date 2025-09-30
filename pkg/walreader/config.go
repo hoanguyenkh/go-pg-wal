@@ -38,6 +38,10 @@ type Config struct {
 	// Output plugin for logical replication (default: pgoutput)
 	OutputPlugin string
 
+	// Batch processing configuration
+	BatchSize    int           // Number of messages to batch before processing (0 = no batching)
+	BatchTimeout time.Duration // Max time to wait before flushing batch (default: 1s)
+
 	Schema       string
 	MapTableName map[string]bool
 }
@@ -57,6 +61,8 @@ func NewConfig(connString, slotName, publicationName, schema, tables string) *Co
 		StandbyMessageTimeout: 10 * time.Second,
 		PluginArgs:            []string{"proto_version '1'"},
 		OutputPlugin:          "pgoutput", // Default output plugin
+		BatchSize:             0,          // No batching by default
+		BatchTimeout:          1 * time.Second,
 		Schema:                schema,
 		MapTableName:          mapTableName,
 	}

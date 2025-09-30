@@ -25,6 +25,25 @@ type MessageHandler interface {
 	HandleCommitTransaction() error
 }
 
+// BatchMessage represents a single message in a batch
+type BatchMessage struct {
+	Type     string // "insert", "update", "delete", "relation"
+	Insert   *format.Insert
+	Update   *format.Update
+	Delete   *format.Delete
+	Relation *format.Relation
+}
+
+// BatchMessageHandler defines the interface for handling WAL messages in batches
+// If a handler implements this interface, the reader will use batch processing
+type BatchMessageHandler interface {
+	MessageHandler // Still supports single message handling as fallback
+
+	// HandleBatch is called when a batch of messages is ready to be processed
+	// Returns error if batch processing fails
+	HandleBatch(messages []BatchMessage) error
+}
+
 // DefaultHandler provides a basic implementation that logs messages
 type DefaultHandler struct{}
 
