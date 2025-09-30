@@ -53,12 +53,45 @@ func (r *Reader) Connect(ctx context.Context) error {
 	// Load last LSN from state store
 	lastLSN, err := r.stateStore.LoadLSN(ctx, r.config.LSNStateKey)
 	if err != nil {
-		lastLSN = 0 // Start from beginning if no state found
-		log.Printf("No previous LSN state found, starting from beginning: %v", err)
+		// Start from current LSN if no state found (first run)
+		currentLSN, err := r.getCurrentLSN(ctx)
+		if err != nil {
+			log.Printf("Failed to get current LSN, starting from beginning: %v", err)
+			lastLSN = 0
+		} else {
+			lastLSN = currentLSN
+			log.Printf("No previous LSN state found, starting from current LSN: %s", lastLSN)
+		}
+	} else {
+		log.Printf("Loaded previous LSN state: %s", lastLSN)
 	}
 	r.lastLSN = lastLSN
 
 	return nil
+}
+
+// getCurrentLSN gets the current WAL LSN from PostgreSQL
+func (r *Reader) getCurrentLSN(ctx context.Context) (pglogrepl.LSN, error) {
+	// Query the current WAL LSN position
+	query := "SELECT pg_current_wal_lsn()"
+	result := r.conn.Exec(ctx, query)
+
+	results, err := result.ReadAll()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get current WAL LSN: %w", err)
+	}
+
+	if len(results) == 0 || len(results[0].Rows) == 0 {
+		return 0, fmt.Errorf("no result returned from pg_current_wal_lsn()")
+	}
+
+	lsnStr := string(results[0].Rows[0][0])
+	lsn, err := pglogrepl.ParseLSN(lsnStr)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse LSN '%s': %w", lsnStr, err)
+	}
+
+	return lsn, nil
 }
 
 // ensureReplicationSlot checks if the replication slot exists and creates it if it doesn't
