@@ -444,7 +444,7 @@ func (r *Reader) handleXLogData(data []byte) error {
 	}
 
 	// Update and save the latest LSN
-	r.lastLSN = xld.WALStart + pglogrepl.LSN(len(xld.WALData))
+	r.lastLSN = xld.WALStart
 	if isSaveLsn {
 		err = r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, r.lastLSN)
 		if err != nil {
