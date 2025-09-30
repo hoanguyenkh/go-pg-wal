@@ -175,8 +175,8 @@ func DBExample() {
 	// Create configuration with database store
 	config := walreader.NewConfig(
 		"postgres://postgres:123456@localhost:5432/kyberdata?replication=database",
-		"my_replication_slot",
-		"my_publication",
+		ReplicationSlotName,
+		PublicationName,
 		"public",
 		"pool_positions,pool_state_dbs",
 	)

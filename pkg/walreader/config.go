@@ -35,6 +35,9 @@ type Config struct {
 	// Plugin arguments (default: proto_version '1')
 	PluginArgs []string
 
+	// Output plugin for logical replication (default: pgoutput)
+	OutputPlugin string
+
 	Schema       string
 	MapTableName map[string]bool
 }
@@ -53,6 +56,7 @@ func NewConfig(connString, slotName, publicationName, schema, tables string) *Co
 		LSNStateFile:          "wal_sync_state.lsn",
 		StandbyMessageTimeout: 10 * time.Second,
 		PluginArgs:            []string{"proto_version '1'"},
+		OutputPlugin:          "pgoutput", // Default output plugin
 		Schema:                schema,
 		MapTableName:          mapTableName,
 	}
