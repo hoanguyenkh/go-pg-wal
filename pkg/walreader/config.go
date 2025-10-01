@@ -6,7 +6,6 @@ import (
 
 	"github.com/KyberNetwork/kutils/cache"
 	"github.com/hoanguyenkh/go-pg-wal/pkg/state"
-	"github.com/hoanguyenkh/go-pg-wal/pkg/utils"
 )
 
 // Config holds configuration for the WAL reader
@@ -60,19 +59,6 @@ func NewConfig(connString, slotName, publicationName, schema, tables string) *Co
 		Schema:                schema,
 		MapTableName:          mapTableName,
 	}
-}
-
-func (c *Config) IsWhiteListTable(schema, table string) bool {
-	if c.Schema != schema {
-		return false
-	}
-	if table == utils.WalLsnState {
-		return false
-	}
-	if len(c.MapTableName) == 0 {
-		return true
-	}
-	return c.MapTableName[table]
 }
 
 // WithFileStore sets the config to use file-based LSN storage

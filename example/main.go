@@ -183,9 +183,13 @@ func DBExample() {
 func Handler(ctx *walreader.ListenerContext) {
 	switch msg := ctx.Message.(type) {
 	case *format.Insert:
-		fmt.Println("Insert table", msg.TableName)
+		fmt.Println("Insert table", msg.TableName, msg.XID)
 	case *format.Update:
-		fmt.Println("Update table", msg.TableName)
+		fmt.Println("Update table", msg.TableName, msg.XID)
+	case *format.Begin:
+		fmt.Println("Begin transaction", msg.XID, msg.FinalLSN)
+	case *format.Commit:
+		fmt.Println("Commit transaction", msg.CommitLSN, msg.EndLSN)
 	}
 
 	if err := ctx.Ack(); err != nil {

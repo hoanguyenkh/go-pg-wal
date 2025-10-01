@@ -51,11 +51,9 @@ func New(data []byte, serverTime time.Time, relation map[uint32]*format.Relation
 	case DeleteByte:
 		return format.NewDelete(data, streamedTransaction, relation, serverTime)
 	case BeginByte:
-		// Begin transaction - return a special marker or nil
-		return "BEGIN_TRANSACTION", nil
+		return format.NewBegin(data, serverTime)
 	case CommitByte:
-		// Commit transaction - return a special marker or nil
-		return "COMMIT_TRANSACTION", nil
+		return format.NewCommit(data, serverTime)
 	case StreamStopByte, StreamAbortByte, StreamCommitByte:
 		streamedTransaction = false
 		return nil, nil
