@@ -358,26 +358,12 @@ func (r *Reader) Run(ctx context.Context) error {
 
 	go r.process(ctx)
 
-	nextStandbyMessageDeadline := time.Now().Add(r.config.StandbyMessageTimeout)
-
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("Replication stopped by context")
 			return ctx.Err()
 		default:
-		}
-
-		// Send standby status to keep connection alive
-		if time.Now().After(nextStandbyMessageDeadline) {
-			err := pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
-				WALWritePosition: r.lastLSN,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to send standby status update: %w", err)
-			}
-			log.Printf("Sent standby status, LSN: %s", r.lastLSN)
-			nextStandbyMessageDeadline = time.Now().Add(r.config.StandbyMessageTimeout)
 		}
 
 		// Receive message from PostgreSQL
@@ -412,33 +398,13 @@ func (r *Reader) Run(ctx context.Context) error {
 func (r *Reader) processMessage(ctx context.Context, msg *pgproto3.CopyData) error {
 	switch msg.Data[0] {
 	case pglogrepl.PrimaryKeepaliveMessageByteID:
-		return r.handleKeepalive(msg.Data[1:])
-
+		return nil
 	case pglogrepl.XLogDataByteID:
 		return r.handleXLogData(msg.Data[1:])
 	default:
 		log.Printf("Unknown message type: %c", msg.Data[0])
 		return nil
 	}
-}
-
-// handleKeepalive processes keepalive messages
-func (r *Reader) handleKeepalive(data []byte) error {
-	pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(data)
-	if err != nil {
-		return fmt.Errorf("failed to parse PrimaryKeepaliveMessage: %w", err)
-	}
-
-	if pkm.ReplyRequested {
-		// Send immediate reply if requested
-		err = pglogrepl.SendStandbyStatusUpdate(context.Background(), r.conn, pglogrepl.StandbyStatusUpdate{
-			WALWritePosition: r.lastLSN,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to send requested standby status: %w", err)
-		}
-	}
-	return nil
 }
 
 // handleXLogData processes WAL data messages
