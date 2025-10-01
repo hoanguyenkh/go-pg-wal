@@ -6,7 +6,13 @@ import (
 
 	"github.com/go-playground/errors"
 	"github.com/hoanguyenkh/go-pg-wal/pkg/message/format"
+	"github.com/jackc/pglogrepl"
 )
+
+type Message struct {
+	Message  any
+	WalStart pglogrepl.LSN
+}
 
 const (
 	StreamAbortByte  Type = 'A'

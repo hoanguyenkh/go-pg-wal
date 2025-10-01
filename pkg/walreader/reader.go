@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/KyberNetwork/logger"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -16,18 +17,26 @@ import (
 	"github.com/hoanguyenkh/go-pg-wal/pkg/state"
 )
 
+type ListenerContext struct {
+	Message any
+	Ack     func() error
+}
+
+type ListenerFunc func(ctx *ListenerContext)
+
 // Reader handles PostgreSQL WAL replication
 type Reader struct {
-	config     *Config
-	handler    MessageHandler
-	conn       *pgconn.PgConn
-	relations  map[uint32]*format.Relation
-	lastLSN    pglogrepl.LSN
-	stateStore state.IStateStore
+	config       *Config
+	conn         *pgconn.PgConn
+	relations    map[uint32]*format.Relation
+	lastLSN      pglogrepl.LSN
+	stateStore   state.IStateStore
+	listenerFunc ListenerFunc
+	messageCH    chan *message.Message
 }
 
 // NewReader creates a new WAL reader
-func NewReader(config *Config, handler MessageHandler) *Reader {
+func NewReader(config *Config, listenerFunc ListenerFunc) *Reader {
 	// Use provided IStateStore or default to file store
 	stateStore := config.StateStore
 	if stateStore == nil {
@@ -35,10 +44,11 @@ func NewReader(config *Config, handler MessageHandler) *Reader {
 	}
 
 	return &Reader{
-		config:     config,
-		handler:    handler,
-		relations:  make(map[uint32]*format.Relation),
-		stateStore: stateStore,
+		config:       config,
+		listenerFunc: listenerFunc,
+		messageCH:    make(chan *message.Message, 2048),
+		relations:    make(map[uint32]*format.Relation),
+		stateStore:   stateStore,
 	}
 }
 
@@ -346,7 +356,7 @@ func (r *Reader) Run(ctx context.Context) error {
 		return fmt.Errorf("not connected - call Connect() first")
 	}
 
-	nextStandbyMessageDeadline := time.Now().Add(r.config.StandbyMessageTimeout)
+	go r.process(ctx)
 
 	for {
 		select {
@@ -354,18 +364,6 @@ func (r *Reader) Run(ctx context.Context) error {
 			log.Println("Replication stopped by context")
 			return ctx.Err()
 		default:
-		}
-
-		// Send standby status to keep connection alive
-		if time.Now().After(nextStandbyMessageDeadline) {
-			err := pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
-				WALWritePosition: r.lastLSN,
-			})
-			if err != nil {
-				return fmt.Errorf("failed to send standby status update: %w", err)
-			}
-			log.Printf("Sent standby status, LSN: %s", r.lastLSN)
-			nextStandbyMessageDeadline = time.Now().Add(r.config.StandbyMessageTimeout)
 		}
 
 		// Receive message from PostgreSQL
@@ -400,34 +398,13 @@ func (r *Reader) Run(ctx context.Context) error {
 func (r *Reader) processMessage(ctx context.Context, msg *pgproto3.CopyData) error {
 	switch msg.Data[0] {
 	case pglogrepl.PrimaryKeepaliveMessageByteID:
-		return r.handleKeepalive(msg.Data[1:])
-
+		return nil
 	case pglogrepl.XLogDataByteID:
 		return r.handleXLogData(msg.Data[1:])
-
 	default:
 		log.Printf("Unknown message type: %c", msg.Data[0])
 		return nil
 	}
-}
-
-// handleKeepalive processes keepalive messages
-func (r *Reader) handleKeepalive(data []byte) error {
-	pkm, err := pglogrepl.ParsePrimaryKeepaliveMessage(data)
-	if err != nil {
-		return fmt.Errorf("failed to parse PrimaryKeepaliveMessage: %w", err)
-	}
-
-	if pkm.ReplyRequested {
-		// Send immediate reply if requested
-		err = pglogrepl.SendStandbyStatusUpdate(context.Background(), r.conn, pglogrepl.StandbyStatusUpdate{
-			WALWritePosition: r.lastLSN,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to send requested standby status: %w", err)
-		}
-	}
-	return nil
 }
 
 // handleXLogData processes WAL data messages
@@ -438,69 +415,61 @@ func (r *Reader) handleXLogData(data []byte) error {
 	}
 
 	// Process the logical message using pkg/message
-	isSaveLsn, err := r.handleLogicalMessage(xld.WALData, time.Now())
+	err = r.handleLogicalMessage(xld.WALData, time.Now(), xld.WALStart)
 	if err != nil {
 		return fmt.Errorf("error processing logical message: %w", err)
 	}
-
 	// Update and save the latest LSN
 	r.lastLSN = xld.WALStart
-	if isSaveLsn {
-		err = r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, r.lastLSN)
-		if err != nil {
-			return fmt.Errorf("CRITICAL: cannot save LSN state: %w", err)
-		}
-	}
 	return nil
 }
 
 // handleLogicalMessage processes logical replication messages
-func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time) (bool, error) {
-	msg, err := message.New(data, serverTime, r.relations)
+func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time, walStart pglogrepl.LSN) error {
+	decodedMsg, err := message.New(data, serverTime, r.relations)
 	if err != nil {
 		// Ignore unsupported messages
 		if err.Error() == "message byte not supported" {
 			log.Printf("Unsupported message type: %c", data[0])
-			return false, nil
+			return nil
 		}
 		// Don't fail on parse errors, just log them
 		log.Printf("Warning: failed to parse message: %v", err)
-		return false, nil
+		return nil
 	}
-
-	if msg == nil {
+	if decodedMsg == nil {
 		// Some messages return nil (like stream control messages)
-		return false, nil
+		return nil
 	}
+	r.messageCH <- &message.Message{
+		Message:  decodedMsg,
+		WalStart: walStart,
+	}
+	return nil
+}
 
-	// Handle different message types
-	switch m := msg.(type) {
-	case string:
-		return false, nil
-	case *format.Relation:
-		if !r.config.IsWhiteListTable(m.Namespace, m.Name) {
-			return false, nil
-		}
-		return true, r.handler.HandleRelation(m)
-	case *format.Insert:
-		if !r.config.IsWhiteListTable(m.TableNamespace, m.TableName) {
-			return false, nil
-		}
-		return true, r.handler.HandleInsert(m)
-	case *format.Update:
-		if !r.config.IsWhiteListTable(m.TableNamespace, m.TableName) {
-			return false, nil
-		}
-		return true, r.handler.HandleUpdate(m)
-	case *format.Delete:
-		if !r.config.IsWhiteListTable(m.TableNamespace, m.TableName) {
-			return false, nil
-		}
-		return true, r.handler.HandleDelete(m)
+func (r *Reader) process(ctx context.Context) {
+	logger.Info("postgres message process started")
 
-	default:
-		log.Printf("Unhandled message type: %T", m)
-		return false, nil
+	for {
+		msg, ok := <-r.messageCH
+		if !ok {
+			break
+		}
+
+		lCtx := &ListenerContext{
+			Message: msg.Message,
+			Ack: func() error {
+				err := r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, msg.WalStart)
+				if err != nil {
+					return err
+				}
+				return pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
+					WALWritePosition: msg.WalStart,
+				})
+			},
+		}
+		r.listenerFunc(lCtx)
 	}
 }
 
