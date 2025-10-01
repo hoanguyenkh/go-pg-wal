@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -59,10 +61,9 @@ func FileExample() {
 // runWALReader is the common WAL reader logic
 func runWALReader(config *walreader.Config, storageType string) {
 	// Create message handler
-	handler := &MySQLHandler{}
 
 	// Create WAL reader
-	reader := walreader.NewReader(config, handler)
+	reader := walreader.NewReader(config, Handler)
 
 	// Handle shutdown signals to exit gracefully
 	ctx, cancel := context.WithCancel(context.Background())
@@ -96,49 +97,6 @@ func runWALReader(config *walreader.Config, storageType string) {
 	}
 
 	log.Println("Application stopped.")
-}
-
-// MySQLHandler implements walreader.MessageHandler to generate MySQL queries
-type MySQLHandler struct {
-	walreader.DefaultHandler
-}
-
-// HandleInsert processes INSERT messages
-func (h *MySQLHandler) HandleInsert(msg *format.Insert) error {
-	log.Printf("[INSERT] Table: %s", msg.TableName)
-	log.Printf("[INSERT] Data: %+v\n", msg.Decoded)
-	return nil
-}
-
-// HandleUpdate processes UPDATE messages
-func (h *MySQLHandler) HandleUpdate(msg *format.Update) error {
-	log.Printf("[UPDATE] Table: %s", msg.TableName)
-	log.Printf("[UPDATE] Old Data: %+v", msg.OldDecoded)
-	log.Printf("[UPDATE] New Data: %+v\n", msg.NewDecoded)
-	return nil
-}
-
-// HandleDelete processes DELETE messages
-func (h *MySQLHandler) HandleDelete(msg *format.Delete) error {
-	log.Printf("[DELETE] Table: %s", msg.TableName)
-	log.Printf("[DELETE] Data: %+v\n", msg.OldDecoded)
-	return nil
-}
-
-// HandleRelation processes relation (table schema) messages
-func (h *MySQLHandler) HandleRelation(msg *format.Relation) error {
-	log.Printf("Received schema for table: %s.%s", msg.Namespace, msg.Name)
-	return nil
-}
-
-// HandleBeginTransaction processes transaction begin
-func (h *MySQLHandler) HandleBeginTransaction() error {
-	return nil
-}
-
-// HandleCommitTransaction processes transaction commit
-func (h *MySQLHandler) HandleCommitTransaction() error {
-	return nil
 }
 
 func RedisExample() {
@@ -185,12 +143,8 @@ func DBExample() {
 	if err != nil {
 		log.Fatalf("Failed to create DB store: %v", err)
 	}
-
-	// Create message handler
-	handler := &MySQLHandler{}
-
 	// Create WAL reader
-	reader := walreader.NewReader(config, handler)
+	reader := walreader.NewReader(config, Handler)
 
 	// Handle shutdown signals
 	ctx, cancel := context.WithCancel(context.Background())
@@ -224,4 +178,17 @@ func DBExample() {
 	}
 
 	log.Println("Application stopped.")
+}
+
+func Handler(ctx *walreader.ListenerContext) {
+	switch msg := ctx.Message.(type) {
+	case *format.Insert:
+		fmt.Println("Insert table", msg.TableName)
+	case *format.Update:
+		fmt.Println("Update table", msg.TableName)
+	}
+
+	if err := ctx.Ack(); err != nil {
+		slog.Error("ack", "error", err)
+	}
 }
