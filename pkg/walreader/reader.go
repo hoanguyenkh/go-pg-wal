@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/KyberNetwork/logger"
@@ -33,6 +34,7 @@ type Reader struct {
 	stateStore   state.IStateStore
 	listenerFunc ListenerFunc
 	messageCH    chan *message.Message
+	lastSaveDb   atomic.Int64
 }
 
 // NewReader creates a new WAL reader
@@ -76,6 +78,7 @@ func (r *Reader) Connect(ctx context.Context) error {
 		log.Printf("Loaded previous LSN state: %s", lastLSN)
 	}
 	r.lastLSN = lastLSN
+	r.lastSaveDb.Store(int64(lastLSN))
 
 	return nil
 }
@@ -338,7 +341,6 @@ func (r *Reader) StartReplication(ctx context.Context) error {
 
 	// Prepare plugin arguments
 	pluginArgs := append(r.config.PluginArgs, fmt.Sprintf("publication_names '%s'", r.config.PublicationName))
-
 	err = pglogrepl.StartReplication(ctx, r.conn, r.config.SlotName, r.lastLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: pluginArgs,
 	})
@@ -419,13 +421,14 @@ func (r *Reader) handleXLogData(data []byte) error {
 	if err != nil {
 		return fmt.Errorf("error processing logical message: %w", err)
 	}
-	// Update and save the latest LSN
-	r.lastLSN = xld.WALStart
 	return nil
 }
 
 // handleLogicalMessage processes logical replication messages
 func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time, walStart pglogrepl.LSN) error {
+	if walStart == 0 {
+		log.Printf("DEBUG: Message with WALStart=0, type=%c (0x%02x)", data[0], data[0])
+	}
 	decodedMsg, err := message.New(data, serverTime, r.relations)
 	if err != nil {
 		// Ignore unsupported messages
@@ -441,6 +444,14 @@ func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time, walStar
 		// Some messages return nil (like stream control messages)
 		return nil
 	}
+	// Skip Relation messages - they are metadata only and already stored in r.relations
+	if _, isRelation := decodedMsg.(*format.Relation); isRelation {
+		log.Printf("DEBUG: Skipping Relation message (metadata only)")
+		return nil
+	}
+
+	r.lastLSN = walStart
+
 	r.messageCH <- &message.Message{
 		Message:  decodedMsg,
 		WalStart: walStart,
@@ -460,13 +471,17 @@ func (r *Reader) process(ctx context.Context) {
 		lCtx := &ListenerContext{
 			Message: msg.Message,
 			Ack: func() error {
-				err := r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, msg.WalStart)
-				if err != nil {
-					return err
+				if r.lastSaveDb.Load() < int64(msg.WalStart) {
+					err := r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, msg.WalStart)
+					if err != nil {
+						return err
+					}
+					r.lastSaveDb.Store(int64(msg.WalStart))
+					return pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
+						WALWritePosition: msg.WalStart,
+					})
 				}
-				return pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
-					WALWritePosition: msg.WalStart,
-				})
+				return nil
 			},
 		}
 		r.listenerFunc(lCtx)
@@ -495,9 +510,4 @@ func (r *Reader) Close(ctx context.Context) error {
 	}
 
 	return err
-}
-
-// GetLastLSN returns the last processed LSN
-func (r *Reader) GetLastLSN() pglogrepl.LSN {
-	return r.lastLSN
 }
