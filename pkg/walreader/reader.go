@@ -479,6 +479,7 @@ func (r *Reader) process(ctx context.Context) {
 					r.lastSaveDb.Store(int64(msg.WalStart))
 					return pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
 						WALWritePosition: msg.WalStart,
+						WALFlushPosition: msg.WalStart,
 					})
 				}
 				return nil
