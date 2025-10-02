@@ -369,6 +369,14 @@ func (r *Reader) Run(ctx context.Context) error {
 		rawMsg, err := r.conn.ReceiveMessage(ctx)
 		if err != nil {
 			if pgconn.Timeout(err) {
+				err = pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
+					WALWritePosition: r.lastLSN,
+					WALFlushPosition: r.lastLSN,
+				})
+				if err != nil {
+					return fmt.Errorf("send stand by status update %v", err)
+				}
+				logger.Debug("send stand by status update")
 				continue
 			}
 			return fmt.Errorf("error receiving message: %w", err)
