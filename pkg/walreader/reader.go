@@ -366,7 +366,9 @@ func (r *Reader) Run(ctx context.Context) error {
 		}
 
 		// Receive message from PostgreSQL
-		rawMsg, err := r.conn.ReceiveMessage(ctx)
+		msgCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Millisecond*300))
+		rawMsg, err := r.conn.ReceiveMessage(msgCtx)
+		cancel()
 		if err != nil {
 			if pgconn.Timeout(err) {
 				err = pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
