@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/KyberNetwork/logger"
@@ -34,7 +33,6 @@ type Reader struct {
 	stateStore   state.IStateStore
 	listenerFunc ListenerFunc
 	messageCH    chan *message.Message
-	lastSaveDb   atomic.Int64
 }
 
 // NewReader creates a new WAL reader
@@ -78,7 +76,6 @@ func (r *Reader) Connect(ctx context.Context) error {
 		log.Printf("Loaded previous LSN state: %s", lastLSN)
 	}
 	r.lastLSN = lastLSN
-	r.lastSaveDb.Store(int64(lastLSN))
 
 	return nil
 }
@@ -471,18 +468,14 @@ func (r *Reader) process(ctx context.Context) {
 		lCtx := &ListenerContext{
 			Message: msg.Message,
 			Ack: func() error {
-				if r.lastSaveDb.Load() < int64(msg.WalStart) {
-					err := r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, msg.WalStart)
-					if err != nil {
-						return err
-					}
-					r.lastSaveDb.Store(int64(msg.WalStart))
-					return pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
-						WALWritePosition: msg.WalStart,
-						WALFlushPosition: msg.WalStart,
-					})
+				err := r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, msg.WalStart)
+				if err != nil {
+					return err
 				}
-				return nil
+				return pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
+					WALWritePosition: msg.WalStart,
+					WALFlushPosition: msg.WalStart,
+				})
 			},
 		}
 		r.listenerFunc(lCtx)
