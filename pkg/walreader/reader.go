@@ -378,7 +378,7 @@ func (r *Reader) Run(ctx context.Context) error {
 				if err != nil {
 					return fmt.Errorf("send stand by status update %v", err)
 				}
-				logger.Debug("send stand by status update")
+				log.Print("[WalReader] send stand by status update")
 				continue
 			}
 			return fmt.Errorf("error receiving message: %w", err)
