@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/KyberNetwork/logger"
@@ -24,15 +26,19 @@ type ListenerContext struct {
 
 type ListenerFunc func(ctx *ListenerContext)
 
+type standbyStatusSender func(ctx context.Context, status pglogrepl.StandbyStatusUpdate) error
+
 // Reader handles PostgreSQL WAL replication
 type Reader struct {
-	config       *Config
-	conn         *pgconn.PgConn
-	relations    map[uint32]*format.Relation
-	lastLSN      pglogrepl.LSN
-	stateStore   state.IStateStore
-	listenerFunc ListenerFunc
-	messageCH    chan *message.Message
+	config            *Config
+	conn              *pgconn.PgConn
+	relations         map[uint32]*format.Relation
+	appliedLSN        atomic.Uint64 // latest LSN durably saved by ListenerContext.Ack.
+	ackMu             sync.Mutex
+	stateStore        state.IStateStore
+	listenerFunc      ListenerFunc
+	messageCH         chan *message.Message
+	sendStandbyStatus standbyStatusSender
 }
 
 // NewReader creates a new WAL reader
@@ -43,13 +49,17 @@ func NewReader(config *Config, listenerFunc ListenerFunc) *Reader {
 		stateStore = state.NewFileStore()
 	}
 
-	return &Reader{
+	reader := &Reader{
 		config:       config,
 		listenerFunc: listenerFunc,
 		messageCH:    make(chan *message.Message, 2048),
 		relations:    make(map[uint32]*format.Relation),
 		stateStore:   stateStore,
 	}
+	reader.sendStandbyStatus = func(ctx context.Context, status pglogrepl.StandbyStatusUpdate) error {
+		return pglogrepl.SendStandbyStatusUpdate(ctx, reader.conn, status)
+	}
+	return reader
 }
 
 // Connect establishes connection to PostgreSQL
@@ -75,7 +85,7 @@ func (r *Reader) Connect(ctx context.Context) error {
 	} else {
 		log.Printf("Loaded previous LSN state: %s", lastLSN)
 	}
-	r.lastLSN = lastLSN
+	r.appliedLSN.Store(uint64(lastLSN))
 
 	return nil
 }
@@ -338,14 +348,15 @@ func (r *Reader) StartReplication(ctx context.Context) error {
 
 	// Prepare plugin arguments
 	pluginArgs := append(r.config.PluginArgs, fmt.Sprintf("publication_names '%s'", r.config.PublicationName))
-	err = pglogrepl.StartReplication(ctx, r.conn, r.config.SlotName, r.lastLSN, pglogrepl.StartReplicationOptions{
+	startLSN := pglogrepl.LSN(r.appliedLSN.Load())
+	err = pglogrepl.StartReplication(ctx, r.conn, r.config.SlotName, startLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: pluginArgs,
 	})
 	if err != nil {
 		return fmt.Errorf("cannot start replication: %w", err)
 	}
 
-	log.Printf("Replication started on slot '%s' from LSN %s", r.config.SlotName, r.lastLSN)
+	log.Printf("Replication started on slot '%s' from LSN %s", r.config.SlotName, startLSN)
 	return nil
 }
 
@@ -371,10 +382,7 @@ func (r *Reader) Run(ctx context.Context) error {
 		cancel()
 		if err != nil {
 			if pgconn.Timeout(err) {
-				err = pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
-					WALWritePosition: r.lastLSN,
-					WALFlushPosition: r.lastLSN,
-				})
+				err = r.sendStandbyStatusUpdate(ctx)
 				if err != nil {
 					return fmt.Errorf("send stand by status update %v", err)
 				}
@@ -457,13 +465,33 @@ func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time, walStar
 		return nil
 	}
 
-	r.lastLSN = walStart
-
 	r.messageCH <- &message.Message{
 		Message:  decodedMsg,
 		WalStart: walStart,
 	}
 	return nil
+}
+
+func (r *Reader) sendStandbyStatusUpdate(ctx context.Context) error {
+	lsn := pglogrepl.LSN(r.appliedLSN.Load())
+	return r.sendStandbyStatus(ctx, pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: lsn,
+		WALFlushPosition: lsn,
+	})
+}
+
+func (r *Reader) acknowledge(ctx context.Context, lsn pglogrepl.LSN) error {
+	r.ackMu.Lock()
+	defer r.ackMu.Unlock()
+
+	if lsn <= pglogrepl.LSN(r.appliedLSN.Load()) {
+		return r.sendStandbyStatusUpdate(ctx)
+	}
+	if err := r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, lsn); err != nil {
+		return err
+	}
+	r.appliedLSN.Store(uint64(lsn))
+	return r.sendStandbyStatusUpdate(ctx)
 }
 
 func (r *Reader) process(ctx context.Context) {
@@ -478,14 +506,7 @@ func (r *Reader) process(ctx context.Context) {
 		lCtx := &ListenerContext{
 			Message: msg.Message,
 			Ack: func() error {
-				err := r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, msg.WalStart)
-				if err != nil {
-					return err
-				}
-				return pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
-					WALWritePosition: msg.WalStart,
-					WALFlushPosition: msg.WalStart,
-				})
+				return r.acknowledge(ctx, msg.WalStart)
 			},
 		}
 		r.listenerFunc(lCtx)
