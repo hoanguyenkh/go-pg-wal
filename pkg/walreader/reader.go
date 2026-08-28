@@ -2,6 +2,7 @@ package walreader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -25,13 +26,18 @@ type ListenerContext struct {
 	// Ack records this message as durably processed. Checkpoints advance only
 	// through contiguous acknowledged messages. A Commit acknowledgement covers
 	// every delivered message in that transaction, so consumers can persist a
-	// large transaction atomically and acknowledge its Commit once.
+	// large transaction atomically and acknowledge its Commit once. Callers must
+	// retry ErrAckWindowFull after an earlier acknowledgement advances.
 	Ack func() error
 }
 
 type ListenerFunc func(ctx *ListenerContext)
 
 const defaultDeliveryWindow uint64 = 2048
+
+// ErrAckWindowFull indicates that an out-of-order acknowledgement cannot be
+// retained until the missing prefix is acknowledged.
+var ErrAckWindowFull = errors.New("WAL acknowledgement window is full")
 
 type standbyStatusSender func(ctx context.Context, status pglogrepl.StandbyStatusUpdate) error
 
@@ -625,6 +631,9 @@ func (r *Reader) acknowledge(startSequence, endSequence uint64, lsn pglogrepl.LS
 	}
 
 	acknowledgement, acknowledged := r.acknowledgedRanges[startSequence]
+	if !acknowledged && startSequence > r.nextPersistSequence && uint64(len(r.acknowledgedRanges)) >= r.ackWindow {
+		return ErrAckWindowFull
+	}
 	if !acknowledged || acknowledgement.end < endSequence {
 		r.acknowledgedRanges[startSequence] = acknowledgedRange{end: endSequence, lsn: lsn}
 	}
@@ -709,6 +718,7 @@ func checkpointLSN(msg *message.Message) pglogrepl.LSN {
 func (r *Reader) process(ctx context.Context) {
 	logger.Info("postgres message process started")
 
+	inTransaction := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -717,8 +727,13 @@ func (r *Reader) process(ctx context.Context) {
 			if !ok {
 				return
 			}
-			if err := r.waitForDeliveryWindow(ctx, msg.sequence); err != nil {
-				return
+			// Once a transaction begins, deliver through its Commit even if it
+			// exceeds AckWindow; otherwise a consumer that checkpoints at Commit
+			// could never receive the message that releases the window.
+			if !inTransaction {
+				if err := r.waitForDeliveryWindow(ctx, msg.sequence); err != nil {
+					return
+				}
 			}
 
 			lCtx := &ListenerContext{
@@ -728,6 +743,13 @@ func (r *Reader) process(ctx context.Context) {
 				},
 			}
 			r.listenerFunc(lCtx)
+
+			switch msg.message.Message.(type) {
+			case *format.Begin:
+				inTransaction = true
+			case *format.Commit:
+				inTransaction = false
+			}
 		}
 	}
 }

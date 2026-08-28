@@ -139,6 +139,19 @@ func TestReaderAcknowledgePersistsOnlyContiguousPrefix(t *testing.T) {
 	assert.Equal(t, uint64(120), reader.appliedLSN.Load())
 }
 
+func TestReaderAcknowledgeRejectsExcessUnresolvedRanges(t *testing.T) {
+	stateStore := &testStateStore{}
+	reader := NewReader(&Config{StateStore: stateStore, LSNStateKey: "slot", AckWindow: 1}, nil)
+
+	require.NoError(t, reader.acknowledge(2, 2, 120))
+	require.ErrorIs(t, reader.acknowledge(3, 3, 130), ErrAckWindowFull)
+	assert.Len(t, reader.acknowledgedRanges, 1)
+
+	require.NoError(t, reader.acknowledge(1, 1, 110))
+	assert.Equal(t, []pglogrepl.LSN{120}, stateStore.saved)
+	assert.Empty(t, reader.acknowledgedRanges)
+}
+
 func TestReaderAcknowledgeDefersStandbyStatusToReplicationLoop(t *testing.T) {
 	stateStore := &testStateStore{}
 	reader := NewReader(&Config{StateStore: stateStore, LSNStateKey: "slot"}, nil)
@@ -285,6 +298,42 @@ func TestReaderDeliveryWindowBlocksUntilContiguousAck(t *testing.T) {
 	third := <-delivered
 	assert.Equal(t, uint64(3), third.seq)
 	assert.LessOrEqual(t, len(reader.acknowledgedRanges), 2)
+}
+
+func TestReaderDeliveryWindowAllowsLargeTransactionCommit(t *testing.T) {
+	stateStore := &testStateStore{}
+	reader := NewReader(&Config{StateStore: stateStore, LSNStateKey: "slot", AckWindow: 2}, nil)
+	commitAck := make(chan error, 1)
+	reader.listenerFunc = func(ctx *ListenerContext) {
+		if _, isCommit := ctx.Message.(*format.Commit); isCommit {
+			commitAck <- ctx.Ack()
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go reader.process(ctx)
+
+	require.NoError(t, reader.enqueueMessage(ctx, &queuedMessage{
+		message:          &message.Message{Message: &format.Begin{}, WalStart: 110},
+		sequence:         1,
+		ackStartSequence: 1,
+	}))
+	require.NoError(t, reader.enqueueMessage(ctx, queuedTestMessage(2, 120)))
+	require.NoError(t, reader.enqueueMessage(ctx, queuedTestMessage(3, 130)))
+	require.NoError(t, reader.enqueueMessage(ctx, &queuedMessage{
+		message:          &message.Message{Message: &format.Commit{EndLSN: 150}, WalStart: 140},
+		sequence:         4,
+		ackStartSequence: 1,
+	}))
+
+	select {
+	case err := <-commitAck:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("commit should be delivered even when the transaction exceeds AckWindow")
+	}
+	assert.Equal(t, []pglogrepl.LSN{150}, stateStore.saved)
 }
 
 func TestReaderDeliveryWindowBackpressuresKeepalivePath(t *testing.T) {
