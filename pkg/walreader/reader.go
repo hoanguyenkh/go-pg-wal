@@ -408,10 +408,13 @@ func (r *Reader) Run(ctx context.Context) error {
 		}
 
 		// Receive message from PostgreSQL
-		msgCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(r.standbyMessageTimeout()))
+		msgCtx, cancel := r.newReceiveMessageContext(ctx)
 		rawMsg, err := r.conn.ReceiveMessage(msgCtx)
 		cancel()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if pgconn.Timeout(err) {
 				r.discardRequestedStandbyStatusUpdate()
 				err = r.sendStandbyStatusUpdate(ctx)
@@ -531,6 +534,7 @@ func (r *Reader) sendStandbyStatusUpdate(ctx context.Context) error {
 	return r.sendStandbyStatus(ctx, pglogrepl.StandbyStatusUpdate{
 		WALWritePosition: lsn,
 		WALFlushPosition: lsn,
+		WALApplyPosition: lsn,
 	})
 }
 
@@ -539,6 +543,10 @@ func (r *Reader) standbyMessageTimeout() time.Duration {
 		return r.config.StandbyMessageTimeout
 	}
 	return 10 * time.Second
+}
+
+func (r *Reader) newReceiveMessageContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, r.standbyMessageTimeout())
 }
 
 func (r *Reader) requestStandbyStatusUpdate() {
@@ -565,6 +573,12 @@ func (r *Reader) sendRequestedStandbyStatusUpdate(ctx context.Context) error {
 }
 
 func (r *Reader) enqueueMessage(ctx context.Context, msg *queuedMessage) error {
+	select {
+	case r.messageCH <- msg:
+		return nil
+	default:
+	}
+
 	ticker := time.NewTicker(r.standbyMessageTimeout())
 	defer ticker.Stop()
 
@@ -643,6 +657,13 @@ func (r *Reader) acknowledge(startSequence, endSequence uint64, lsn pglogrepl.LS
 	return nil
 }
 
+func checkpointLSN(msg *message.Message) pglogrepl.LSN {
+	if commit, ok := msg.Message.(*format.Commit); ok && commit.EndLSN != 0 {
+		return pglogrepl.LSN(commit.EndLSN)
+	}
+	return msg.WalStart
+}
+
 func (r *Reader) process(ctx context.Context) {
 	logger.Info("postgres message process started")
 
@@ -658,7 +679,7 @@ func (r *Reader) process(ctx context.Context) {
 			lCtx := &ListenerContext{
 				Message: msg.message.Message,
 				Ack: func() error {
-					return r.acknowledge(msg.ackStartSequence, msg.sequence, msg.message.WalStart)
+					return r.acknowledge(msg.ackStartSequence, msg.sequence, checkpointLSN(msg.message))
 				},
 			}
 			r.listenerFunc(lCtx)

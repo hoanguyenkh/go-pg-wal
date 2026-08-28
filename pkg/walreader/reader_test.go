@@ -49,6 +49,25 @@ func TestReaderStandbyStatusUsesAppliedLSN(t *testing.T) {
 	require.NoError(t, reader.sendStandbyStatusUpdate(context.Background()))
 	assert.Equal(t, pglogrepl.LSN(100), sent.WALWritePosition)
 	assert.Equal(t, pglogrepl.LSN(100), sent.WALFlushPosition)
+	assert.Equal(t, pglogrepl.LSN(100), sent.WALApplyPosition)
+}
+
+func TestReaderReceiveMessageContextHonorsParentCancel(t *testing.T) {
+	config := NewConfig("", "slot", "publication", "", "")
+	config.StandbyMessageTimeout = time.Hour
+	reader := NewReader(config, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	msgCtx, stop := reader.newReceiveMessageContext(ctx)
+	defer stop()
+
+	cancel()
+	select {
+	case <-msgCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("receive context should be canceled when the parent context is canceled")
+	}
+	require.ErrorIs(t, msgCtx.Err(), context.Canceled)
 }
 
 func TestReaderRepliesToRequestedPrimaryKeepalive(t *testing.T) {
@@ -87,6 +106,22 @@ func TestReaderAcknowledgeAdvancesAppliedLSNOnlyAfterCheckpointSave(t *testing.T
 	require.NoError(t, reader.acknowledge(1, 1, 110))
 	assert.Equal(t, uint64(120), reader.appliedLSN.Load())
 	assert.Equal(t, []pglogrepl.LSN{120}, stateStore.saved)
+}
+
+func TestReaderAcknowledgeRetriesCheckpointAfterSaveFailure(t *testing.T) {
+	stateStore := &testStateStore{}
+	reader := NewReader(&Config{StateStore: stateStore, LSNStateKey: "slot"}, nil)
+	reader.appliedLSN.Store(100)
+
+	require.NoError(t, reader.acknowledge(1, 1, 120))
+	stateStore.saveErr = errors.New("checkpoint unavailable")
+	require.Error(t, reader.acknowledge(2, 2, 130))
+	assert.Equal(t, uint64(120), reader.appliedLSN.Load())
+
+	stateStore.saveErr = nil
+	require.NoError(t, reader.acknowledge(2, 2, 130))
+	assert.Equal(t, []pglogrepl.LSN{120, 130}, stateStore.saved)
+	assert.Equal(t, uint64(130), reader.appliedLSN.Load())
 }
 
 func TestReaderAcknowledgePersistsOnlyContiguousPrefix(t *testing.T) {
@@ -150,6 +185,18 @@ func TestReaderEnqueueSendsKeepaliveWhenConsumerQueueIsFull(t *testing.T) {
 	require.ErrorIs(t, <-errCh, context.Canceled)
 }
 
+func TestReaderEnqueueDoesNotSendKeepaliveWhenQueueHasSpace(t *testing.T) {
+	reader := NewReader(NewConfig("", "slot", "publication", "", ""), nil)
+	var sends atomic.Int32
+	reader.sendStandbyStatus = func(_ context.Context, _ pglogrepl.StandbyStatusUpdate) error {
+		sends.Add(1)
+		return nil
+	}
+
+	require.NoError(t, reader.enqueueMessage(context.Background(), &queuedMessage{}))
+	assert.Zero(t, sends.Load())
+}
+
 func TestReaderCommitAcknowledgementCheckpointsWholeTransaction(t *testing.T) {
 	stateStore := &testStateStore{}
 	reader := NewReader(&Config{StateStore: stateStore, LSNStateKey: "slot"}, nil)
@@ -187,5 +234,5 @@ func TestReaderCommitAckCoversAllMessagesInTransaction(t *testing.T) {
 	require.NoError(t, reader.handleLogicalMessage(ctx, commit, time.Now(), 130))
 
 	require.NoError(t, <-ackErr)
-	assert.Equal(t, []pglogrepl.LSN{130}, stateStore.saved)
+	assert.Equal(t, []pglogrepl.LSN{131}, stateStore.saved)
 }
