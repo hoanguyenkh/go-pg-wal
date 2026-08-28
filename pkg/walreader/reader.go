@@ -2,9 +2,12 @@ package walreader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/KyberNetwork/logger"
@@ -18,21 +21,55 @@ import (
 )
 
 type ListenerContext struct {
+	// Message is the decoded logical replication message.
 	Message any
-	Ack     func() error
+	// Ack records this message as durably processed. Checkpoints advance only
+	// through contiguous acknowledged messages. A Commit acknowledgement covers
+	// every delivered message in that transaction, so consumers can persist a
+	// large transaction atomically and acknowledge its Commit once. Callers must
+	// retry ErrAckWindowFull after an earlier acknowledgement advances.
+	Ack func() error
 }
 
 type ListenerFunc func(ctx *ListenerContext)
 
+const defaultDeliveryWindow uint64 = 2048
+
+// ErrAckWindowFull indicates that an out-of-order acknowledgement cannot be
+// retained until the missing prefix is acknowledged.
+var ErrAckWindowFull = errors.New("WAL acknowledgement window is full")
+
+type standbyStatusSender func(ctx context.Context, status pglogrepl.StandbyStatusUpdate) error
+
+type queuedMessage struct {
+	message          *message.Message
+	sequence         uint64
+	ackStartSequence uint64
+}
+
+type acknowledgedRange struct {
+	end uint64
+	lsn pglogrepl.LSN
+}
+
 // Reader handles PostgreSQL WAL replication
 type Reader struct {
-	config       *Config
-	conn         *pgconn.PgConn
-	relations    map[uint32]*format.Relation
-	lastLSN      pglogrepl.LSN
-	stateStore   state.IStateStore
-	listenerFunc ListenerFunc
-	messageCH    chan *message.Message
+	config                   *Config
+	conn                     *pgconn.PgConn
+	relations                map[uint32]*format.Relation
+	appliedLSN               atomic.Uint64 // latest LSN durably saved by ListenerContext.Ack.
+	ackMu                    sync.Mutex
+	acknowledgedRanges       map[uint64]acknowledgedRange
+	nextMessageSequence      uint64 // owned by the replication loop
+	transactionStartSequence uint64 // owned by the replication loop
+	nextPersistSequence      uint64 // protected by ackMu
+	ackWindow                uint64
+	ackProgress              chan struct{}
+	stateStore               state.IStateStore
+	listenerFunc             ListenerFunc
+	messageCH                chan *queuedMessage
+	statusUpdateRequested    chan struct{}
+	sendStandbyStatus        standbyStatusSender
 }
 
 // NewReader creates a new WAL reader
@@ -43,13 +80,27 @@ func NewReader(config *Config, listenerFunc ListenerFunc) *Reader {
 		stateStore = state.NewFileStore()
 	}
 
-	return &Reader{
-		config:       config,
-		listenerFunc: listenerFunc,
-		messageCH:    make(chan *message.Message, 2048),
-		relations:    make(map[uint32]*format.Relation),
-		stateStore:   stateStore,
+	ackWindow := config.AckWindow
+	if ackWindow == 0 {
+		ackWindow = defaultDeliveryWindow
 	}
+
+	reader := &Reader{
+		config:                config,
+		listenerFunc:          listenerFunc,
+		messageCH:             make(chan *queuedMessage, defaultDeliveryWindow),
+		relations:             make(map[uint32]*format.Relation),
+		acknowledgedRanges:    make(map[uint64]acknowledgedRange),
+		nextPersistSequence:   1,
+		ackWindow:             ackWindow,
+		ackProgress:           make(chan struct{}, 1),
+		stateStore:            stateStore,
+		statusUpdateRequested: make(chan struct{}, 1),
+	}
+	reader.sendStandbyStatus = func(ctx context.Context, status pglogrepl.StandbyStatusUpdate) error {
+		return pglogrepl.SendStandbyStatusUpdate(ctx, reader.conn, status)
+	}
+	return reader
 }
 
 // Connect establishes connection to PostgreSQL
@@ -75,7 +126,7 @@ func (r *Reader) Connect(ctx context.Context) error {
 	} else {
 		log.Printf("Loaded previous LSN state: %s", lastLSN)
 	}
-	r.lastLSN = lastLSN
+	r.appliedLSN.Store(uint64(lastLSN))
 
 	return nil
 }
@@ -338,14 +389,15 @@ func (r *Reader) StartReplication(ctx context.Context) error {
 
 	// Prepare plugin arguments
 	pluginArgs := append(r.config.PluginArgs, fmt.Sprintf("publication_names '%s'", r.config.PublicationName))
-	err = pglogrepl.StartReplication(ctx, r.conn, r.config.SlotName, r.lastLSN, pglogrepl.StartReplicationOptions{
+	startLSN := pglogrepl.LSN(r.appliedLSN.Load())
+	err = pglogrepl.StartReplication(ctx, r.conn, r.config.SlotName, startLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: pluginArgs,
 	})
 	if err != nil {
 		return fmt.Errorf("cannot start replication: %w", err)
 	}
 
-	log.Printf("Replication started on slot '%s' from LSN %s", r.config.SlotName, r.lastLSN)
+	log.Printf("Replication started on slot '%s' from LSN %s", r.config.SlotName, startLSN)
 	return nil
 }
 
@@ -355,7 +407,9 @@ func (r *Reader) Run(ctx context.Context) error {
 		return fmt.Errorf("not connected - call Connect() first")
 	}
 
-	go r.process(ctx)
+	processCtx, cancelProcess := context.WithCancel(ctx)
+	defer cancelProcess()
+	go r.process(processCtx)
 
 	for {
 		select {
@@ -365,16 +419,22 @@ func (r *Reader) Run(ctx context.Context) error {
 		default:
 		}
 
+		// Run is the only goroutine allowed to use r.conn after replication starts.
+		if err := r.sendRequestedStandbyStatusUpdate(ctx); err != nil {
+			return fmt.Errorf("send requested standby status update: %w", err)
+		}
+
 		// Receive message from PostgreSQL
-		msgCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Millisecond*300))
+		msgCtx, cancel := r.newReceiveMessageContext(ctx)
 		rawMsg, err := r.conn.ReceiveMessage(msgCtx)
 		cancel()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if pgconn.Timeout(err) {
-				err = pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
-					WALWritePosition: r.lastLSN,
-					WALFlushPosition: r.lastLSN,
-				})
+				r.discardRequestedStandbyStatusUpdate()
+				err = r.sendStandbyStatusUpdate(ctx)
 				if err != nil {
 					return fmt.Errorf("send stand by status update %v", err)
 				}
@@ -407,9 +467,16 @@ func (r *Reader) Run(ctx context.Context) error {
 func (r *Reader) processMessage(ctx context.Context, msg *pgproto3.CopyData) error {
 	switch msg.Data[0] {
 	case pglogrepl.PrimaryKeepaliveMessageByteID:
+		keepalive, err := pglogrepl.ParsePrimaryKeepaliveMessage(msg.Data[1:])
+		if err != nil {
+			return fmt.Errorf("failed to parse primary keepalive message: %w", err)
+		}
+		if keepalive.ReplyRequested {
+			return r.sendStandbyStatusUpdate(ctx)
+		}
 		return nil
 	case pglogrepl.XLogDataByteID:
-		return r.handleXLogData(msg.Data[1:])
+		return r.handleXLogData(ctx, msg.Data[1:])
 	default:
 		log.Printf("Unknown message type: %c", msg.Data[0])
 		return nil
@@ -417,14 +484,14 @@ func (r *Reader) processMessage(ctx context.Context, msg *pgproto3.CopyData) err
 }
 
 // handleXLogData processes WAL data messages
-func (r *Reader) handleXLogData(data []byte) error {
+func (r *Reader) handleXLogData(ctx context.Context, data []byte) error {
 	xld, err := pglogrepl.ParseXLogData(data)
 	if err != nil {
 		return fmt.Errorf("failed to parse XLogData: %w", err)
 	}
 
 	// Process the logical message using pkg/message
-	err = r.handleLogicalMessage(xld.WALData, time.Now(), xld.WALStart)
+	err = r.handleLogicalMessage(ctx, xld.WALData, time.Now(), xld.WALStart)
 	if err != nil {
 		return fmt.Errorf("error processing logical message: %w", err)
 	}
@@ -432,7 +499,7 @@ func (r *Reader) handleXLogData(data []byte) error {
 }
 
 // handleLogicalMessage processes logical replication messages
-func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time, walStart pglogrepl.LSN) error {
+func (r *Reader) handleLogicalMessage(ctx context.Context, data []byte, serverTime time.Time, walStart pglogrepl.LSN) error {
 	if walStart == 0 {
 		log.Printf("DEBUG: Message with WALStart=0, type=%c (0x%02x)", data[0], data[0])
 	}
@@ -457,38 +524,233 @@ func (r *Reader) handleLogicalMessage(data []byte, serverTime time.Time, walStar
 		return nil
 	}
 
-	r.lastLSN = walStart
-
-	r.messageCH <- &message.Message{
-		Message:  decodedMsg,
-		WalStart: walStart,
+	r.nextMessageSequence++
+	ackStartSequence := r.nextMessageSequence
+	switch decodedMsg.(type) {
+	case *format.Begin:
+		r.transactionStartSequence = r.nextMessageSequence
+	case *format.Commit:
+		if r.transactionStartSequence != 0 {
+			ackStartSequence = r.transactionStartSequence
+			r.transactionStartSequence = 0
+		}
 	}
+
+	return r.enqueueMessage(ctx, &queuedMessage{
+		message: &message.Message{
+			Message:  decodedMsg,
+			WalStart: walStart,
+		},
+		sequence:         r.nextMessageSequence,
+		ackStartSequence: ackStartSequence,
+	})
+}
+
+func (r *Reader) sendStandbyStatusUpdate(ctx context.Context) error {
+	lsn := pglogrepl.LSN(r.appliedLSN.Load())
+	return r.sendStandbyStatus(ctx, pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: lsn,
+		WALFlushPosition: lsn,
+		WALApplyPosition: lsn,
+	})
+}
+
+func (r *Reader) standbyMessageTimeout() time.Duration {
+	if r.config != nil && r.config.StandbyMessageTimeout > 0 {
+		return r.config.StandbyMessageTimeout
+	}
+	return 10 * time.Second
+}
+
+func (r *Reader) newReceiveMessageContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, r.standbyMessageTimeout())
+}
+
+func (r *Reader) requestStandbyStatusUpdate() {
+	select {
+	case r.statusUpdateRequested <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Reader) discardRequestedStandbyStatusUpdate() {
+	select {
+	case <-r.statusUpdateRequested:
+	default:
+	}
+}
+
+func (r *Reader) sendRequestedStandbyStatusUpdate(ctx context.Context) error {
+	select {
+	case <-r.statusUpdateRequested:
+		return r.sendStandbyStatusUpdate(ctx)
+	default:
+		return nil
+	}
+}
+
+func (r *Reader) enqueueMessage(ctx context.Context, msg *queuedMessage) error {
+	select {
+	case r.messageCH <- msg:
+		return nil
+	default:
+	}
+
+	ticker := time.NewTicker(r.standbyMessageTimeout())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case r.messageCH <- msg:
+			return nil
+		case <-r.statusUpdateRequested:
+			if err := r.sendStandbyStatusUpdate(ctx); err != nil {
+				return err
+			}
+		case <-ticker.C:
+			if err := r.sendStandbyStatusUpdate(ctx); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (r *Reader) acknowledge(startSequence, endSequence uint64, lsn pglogrepl.LSN) error {
+	r.ackMu.Lock()
+	defer r.ackMu.Unlock()
+
+	if endSequence < r.nextPersistSequence {
+		r.requestStandbyStatusUpdate()
+		return nil
+	}
+
+	if startSequence < r.nextPersistSequence {
+		startSequence = r.nextPersistSequence
+	}
+
+	acknowledgement, acknowledged := r.acknowledgedRanges[startSequence]
+	if !acknowledged && startSequence > r.nextPersistSequence && uint64(len(r.acknowledgedRanges)) >= r.ackWindow {
+		return ErrAckWindowFull
+	}
+	if !acknowledged || acknowledgement.end < endSequence {
+		r.acknowledgedRanges[startSequence] = acknowledgedRange{end: endSequence, lsn: lsn}
+	}
+
+	nextSequence := r.nextPersistSequence
+	persistedSequence := uint64(0)
+	persistedLSN := pglogrepl.LSN(0)
+	readyToPersist := false
+	for {
+		acknowledgement, acknowledged = r.acknowledgedRanges[nextSequence]
+		if !acknowledged {
+			break
+		}
+		readyToPersist = true
+		persistedSequence = acknowledgement.end
+		persistedLSN = acknowledgement.lsn
+		if persistedSequence == ^uint64(0) {
+			break
+		}
+		nextSequence = persistedSequence + 1
+	}
+	if !readyToPersist {
+		r.requestStandbyStatusUpdate()
+		return nil
+	}
+
+	if persistedLSN > pglogrepl.LSN(r.appliedLSN.Load()) {
+		if err := r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, persistedLSN); err != nil {
+			return err
+		}
+		r.appliedLSN.Store(uint64(persistedLSN))
+	}
+
+	for startSequence := range r.acknowledgedRanges {
+		if startSequence <= persistedSequence {
+			delete(r.acknowledgedRanges, startSequence)
+		}
+	}
+	r.nextPersistSequence = persistedSequence + 1
+	r.signalAckProgress()
+	r.requestStandbyStatusUpdate()
 	return nil
+}
+
+func (r *Reader) deliveryWindowFull(sequence uint64) bool {
+	if sequence < r.nextPersistSequence {
+		return false
+	}
+	return sequence-r.nextPersistSequence >= r.ackWindow
+}
+
+func (r *Reader) signalAckProgress() {
+	select {
+	case r.ackProgress <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Reader) waitForDeliveryWindow(ctx context.Context, sequence uint64) error {
+	for {
+		r.ackMu.Lock()
+		full := r.deliveryWindowFull(sequence)
+		r.ackMu.Unlock()
+		if !full {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.ackProgress:
+		}
+	}
+}
+
+func checkpointLSN(msg *message.Message) pglogrepl.LSN {
+	if commit, ok := msg.Message.(*format.Commit); ok && commit.EndLSN != 0 {
+		return pglogrepl.LSN(commit.EndLSN)
+	}
+	return msg.WalStart
 }
 
 func (r *Reader) process(ctx context.Context) {
 	logger.Info("postgres message process started")
 
+	inTransaction := false
 	for {
-		msg, ok := <-r.messageCH
-		if !ok {
-			break
-		}
-
-		lCtx := &ListenerContext{
-			Message: msg.Message,
-			Ack: func() error {
-				err := r.stateStore.SaveLSN(context.Background(), r.config.LSNStateKey, msg.WalStart)
-				if err != nil {
-					return err
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-r.messageCH:
+			if !ok {
+				return
+			}
+			// Once a transaction begins, deliver through its Commit even if it
+			// exceeds AckWindow; otherwise a consumer that checkpoints at Commit
+			// could never receive the message that releases the window.
+			if !inTransaction {
+				if err := r.waitForDeliveryWindow(ctx, msg.sequence); err != nil {
+					return
 				}
-				return pglogrepl.SendStandbyStatusUpdate(ctx, r.conn, pglogrepl.StandbyStatusUpdate{
-					WALWritePosition: msg.WalStart,
-					WALFlushPosition: msg.WalStart,
-				})
-			},
+			}
+
+			lCtx := &ListenerContext{
+				Message: msg.message.Message,
+				Ack: func() error {
+					return r.acknowledge(msg.ackStartSequence, msg.sequence, checkpointLSN(msg.message))
+				},
+			}
+			r.listenerFunc(lCtx)
+
+			switch msg.message.Message.(type) {
+			case *format.Begin:
+				inTransaction = true
+			case *format.Commit:
+				inTransaction = false
+			}
 		}
-		r.listenerFunc(lCtx)
 	}
 }
 
