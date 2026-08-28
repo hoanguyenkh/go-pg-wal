@@ -31,6 +31,11 @@ type Config struct {
 	// Timeout for standby status messages (default: 10s)
 	StandbyMessageTimeout time.Duration
 
+	// AckWindow is the maximum number of delivered messages that may remain
+	// unpersisted. Delivery blocks when the window is full until the contiguous
+	// Ack prefix advances. Zero means the default (2048).
+	AckWindow uint64
+
 	// Plugin arguments (default: proto_version '1')
 	PluginArgs []string
 
@@ -54,6 +59,7 @@ func NewConfig(connString, slotName, publicationName, schema, tables string) *Co
 		LSNStateKey:           slotName, // Use slot name as default key
 		LSNStateFile:          "wal_sync_state.lsn",
 		StandbyMessageTimeout: 10 * time.Second,
+		AckWindow:             defaultDeliveryWindow,
 		PluginArgs:            []string{"proto_version '1'"},
 		OutputPlugin:          "pgoutput", // Default output plugin
 		Schema:                schema,

@@ -31,6 +31,8 @@ type ListenerContext struct {
 
 type ListenerFunc func(ctx *ListenerContext)
 
+const defaultDeliveryWindow uint64 = 2048
+
 type standbyStatusSender func(ctx context.Context, status pglogrepl.StandbyStatusUpdate) error
 
 type queuedMessage struct {
@@ -55,6 +57,8 @@ type Reader struct {
 	nextMessageSequence      uint64 // owned by the replication loop
 	transactionStartSequence uint64 // owned by the replication loop
 	nextPersistSequence      uint64 // protected by ackMu
+	ackWindow                uint64
+	ackProgress              chan struct{}
 	stateStore               state.IStateStore
 	listenerFunc             ListenerFunc
 	messageCH                chan *queuedMessage
@@ -70,13 +74,20 @@ func NewReader(config *Config, listenerFunc ListenerFunc) *Reader {
 		stateStore = state.NewFileStore()
 	}
 
+	ackWindow := config.AckWindow
+	if ackWindow == 0 {
+		ackWindow = defaultDeliveryWindow
+	}
+
 	reader := &Reader{
 		config:                config,
 		listenerFunc:          listenerFunc,
-		messageCH:             make(chan *queuedMessage, 2048),
+		messageCH:             make(chan *queuedMessage, defaultDeliveryWindow),
 		relations:             make(map[uint32]*format.Relation),
 		acknowledgedRanges:    make(map[uint64]acknowledgedRange),
 		nextPersistSequence:   1,
+		ackWindow:             ackWindow,
+		ackProgress:           make(chan struct{}, 1),
 		stateStore:            stateStore,
 		statusUpdateRequested: make(chan struct{}, 1),
 	}
@@ -653,8 +664,39 @@ func (r *Reader) acknowledge(startSequence, endSequence uint64, lsn pglogrepl.LS
 		}
 	}
 	r.nextPersistSequence = persistedSequence + 1
+	r.signalAckProgress()
 	r.requestStandbyStatusUpdate()
 	return nil
+}
+
+func (r *Reader) deliveryWindowFull(sequence uint64) bool {
+	if sequence < r.nextPersistSequence {
+		return false
+	}
+	return sequence-r.nextPersistSequence >= r.ackWindow
+}
+
+func (r *Reader) signalAckProgress() {
+	select {
+	case r.ackProgress <- struct{}{}:
+	default:
+	}
+}
+
+func (r *Reader) waitForDeliveryWindow(ctx context.Context, sequence uint64) error {
+	for {
+		r.ackMu.Lock()
+		full := r.deliveryWindowFull(sequence)
+		r.ackMu.Unlock()
+		if !full {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-r.ackProgress:
+		}
+	}
 }
 
 func checkpointLSN(msg *message.Message) pglogrepl.LSN {
@@ -673,6 +715,9 @@ func (r *Reader) process(ctx context.Context) {
 			return
 		case msg, ok := <-r.messageCH:
 			if !ok {
+				return
+			}
+			if err := r.waitForDeliveryWindow(ctx, msg.sequence); err != nil {
 				return
 			}
 

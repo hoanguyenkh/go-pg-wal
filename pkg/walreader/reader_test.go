@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hoanguyenkh/go-pg-wal/pkg/message"
 	"github.com/hoanguyenkh/go-pg-wal/pkg/message/format"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgproto3"
@@ -235,4 +236,114 @@ func TestReaderCommitAckCoversAllMessagesInTransaction(t *testing.T) {
 
 	require.NoError(t, <-ackErr)
 	assert.Equal(t, []pglogrepl.LSN{131}, stateStore.saved)
+}
+
+func queuedTestMessage(sequence uint64, lsn pglogrepl.LSN) *queuedMessage {
+	return &queuedMessage{
+		message: &message.Message{
+			Message:  sequence,
+			WalStart: lsn,
+		},
+		sequence:         sequence,
+		ackStartSequence: sequence,
+	}
+}
+
+func TestReaderDeliveryWindowBlocksUntilContiguousAck(t *testing.T) {
+	stateStore := &testStateStore{}
+	reader := NewReader(&Config{StateStore: stateStore, LSNStateKey: "slot", AckWindow: 2}, nil)
+
+	type delivery struct {
+		seq uint64
+		ack func() error
+	}
+	delivered := make(chan delivery, 8)
+	reader.listenerFunc = func(ctx *ListenerContext) {
+		delivered <- delivery{seq: ctx.Message.(uint64), ack: ctx.Ack}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go reader.process(ctx)
+
+	require.NoError(t, reader.enqueueMessage(ctx, queuedTestMessage(1, 110)))
+	require.NoError(t, reader.enqueueMessage(ctx, queuedTestMessage(2, 120)))
+	require.NoError(t, reader.enqueueMessage(ctx, queuedTestMessage(3, 130)))
+
+	first := <-delivered
+	second := <-delivered
+	require.Equal(t, uint64(1), first.seq)
+	require.Equal(t, uint64(2), second.seq)
+
+	select {
+	case extra := <-delivered:
+		t.Fatalf("delivered sequence %d before the ack window opened", extra.seq)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	require.NoError(t, first.ack())
+	third := <-delivered
+	assert.Equal(t, uint64(3), third.seq)
+	assert.LessOrEqual(t, len(reader.acknowledgedRanges), 2)
+}
+
+func TestReaderDeliveryWindowBackpressuresKeepalivePath(t *testing.T) {
+	config := NewConfig("", "slot", "publication", "", "")
+	config.StandbyMessageTimeout = time.Millisecond
+	config.AckWindow = 1
+	stateStore := &testStateStore{}
+	config.StateStore = stateStore
+	reader := NewReader(config, nil)
+	reader.messageCH = make(chan *queuedMessage, 1)
+
+	delivered := make(chan struct{}, 1)
+	reader.listenerFunc = func(ctx *ListenerContext) {
+		delivered <- struct{}{}
+	}
+
+	sent := make(chan struct{}, 1)
+	reader.sendStandbyStatus = func(_ context.Context, _ pglogrepl.StandbyStatusUpdate) error {
+		sent <- struct{}{}
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go reader.process(ctx)
+
+	require.NoError(t, reader.enqueueMessage(ctx, queuedTestMessage(1, 110)))
+	select {
+	case <-delivered:
+	case <-time.After(time.Second):
+		t.Fatal("expected the first message to be delivered")
+	}
+
+	enqueueErr := make(chan error, 1)
+	go func() {
+		seq := uint64(2)
+		for {
+			err := reader.enqueueMessage(ctx, queuedTestMessage(seq, pglogrepl.LSN(100+seq*10)))
+			if err != nil {
+				enqueueErr <- err
+				return
+			}
+			seq++
+		}
+	}()
+
+	select {
+	case <-sent:
+	case <-time.After(time.Second):
+		t.Fatal("expected a standby status update while the delivery window and queue were full")
+	}
+
+	cancel()
+	require.ErrorIs(t, <-enqueueErr, context.Canceled)
+}
+
+func TestReaderWaitForDeliveryWindowHonorsContext(t *testing.T) {
+	reader := NewReader(&Config{AckWindow: 1}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, reader.waitForDeliveryWindow(ctx, 2), context.Canceled)
 }
