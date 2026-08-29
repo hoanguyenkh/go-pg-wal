@@ -71,6 +71,33 @@ func TestReaderReceiveMessageContextHonorsParentCancel(t *testing.T) {
 	require.ErrorIs(t, msgCtx.Err(), context.Canceled)
 }
 
+func TestApplyLogicalDecodingWorkMem_EmptyIsNoop(t *testing.T) {
+	config := NewConfig("", "slot", "publication", "", "")
+	reader := NewReader(config, nil)
+
+	// r.conn is nil; an empty value must return before touching it.
+	require.NoError(t, reader.applyLogicalDecodingWorkMem(context.Background()))
+}
+
+func TestApplyLogicalDecodingWorkMem_RejectsInvalidValue(t *testing.T) {
+	config := NewConfig("", "slot", "publication", "", "")
+	config.LogicalDecodingWorkMem = "256MB; DROP TABLE foo"
+	reader := NewReader(config, nil)
+
+	err := reader.applyLogicalDecodingWorkMem(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid LogicalDecodingWorkMem")
+}
+
+func TestApplyLogicalDecodingWorkMem_AcceptsValidSyntax(t *testing.T) {
+	for _, value := range []string{"256MB", "65536kB", "1GB", "1TB", "65536B", "134217728"} {
+		assert.True(t, logicalDecodingWorkMemPattern.MatchString(value), "expected %q to be accepted", value)
+	}
+	for _, value := range []string{"", "256 MB; --", "abc", "256MB'", "1PB"} {
+		assert.False(t, logicalDecodingWorkMemPattern.MatchString(value), "expected %q to be rejected", value)
+	}
+}
+
 func TestReaderRepliesToRequestedPrimaryKeepalive(t *testing.T) {
 	reader := NewReader(NewConfig("", "slot", "publication", "", ""), nil)
 	reader.appliedLSN.Store(100)

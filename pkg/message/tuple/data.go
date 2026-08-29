@@ -88,6 +88,18 @@ func (d *Data) DecodeWithColumn(columns []RelationColumn) (map[string]any, error
 				return nil, errors.Wrap(err, "decode column")
 			}
 			decoded[colName] = val
+		case DataTypeBinary:
+			// Sent when the connection negotiates plugin arg binary 'true'.
+			val, err := decodeBinaryColumnData(col.Data, columns[idx].DataType)
+			if err != nil {
+				return nil, errors.Wrap(err, "decode column")
+			}
+			decoded[colName] = val
+		case DataTypeToast:
+			// Unchanged TOAST: Postgres sent no value. Omit the key (Debezium
+			// "omit unavailable value") rather than inserting a zero value.
+		default:
+			return nil, errors.New("unknown tuple data type: " + string(col.DataType))
 		}
 	}
 
@@ -99,4 +111,11 @@ func decodeTextColumnData(data []byte, dataType uint32) (interface{}, error) {
 		return dt.Codec.DecodeValue(typeMap, dataType, pgtype.TextFormatCode, data)
 	}
 	return string(data), nil
+}
+
+func decodeBinaryColumnData(data []byte, dataType uint32) (interface{}, error) {
+	if dt, ok := typeMap.TypeForOID(dataType); ok {
+		return dt.Codec.DecodeValue(typeMap, dataType, pgtype.BinaryFormatCode, data)
+	}
+	return data, nil
 }
