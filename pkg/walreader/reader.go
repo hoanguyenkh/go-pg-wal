@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -111,6 +112,10 @@ func (r *Reader) Connect(ctx context.Context) error {
 	}
 	r.conn = conn
 
+	if err := r.applyLogicalDecodingWorkMem(ctx); err != nil {
+		return err
+	}
+
 	// Load last LSN from state store
 	lastLSN, err := r.stateStore.LoadLSN(ctx, r.config.LSNStateKey)
 	if err != nil {
@@ -128,6 +133,33 @@ func (r *Reader) Connect(ctx context.Context) error {
 	}
 	r.appliedLSN.Store(uint64(lastLSN))
 
+	return nil
+}
+
+// logicalDecodingWorkMemPattern matches Postgres memory-GUC syntax, e.g.
+// "256MB", "65536kB", "1GB", or a bare integer (kB). SET is not parameterizable
+// over the simple query protocol, so the value is validated before interpolation.
+var logicalDecodingWorkMemPattern = regexp.MustCompile(`(?i)^[0-9]+\s*(kb|mb|gb)?$`)
+
+// applyLogicalDecodingWorkMem sets logical_decoding_work_mem on this session
+// only (no ALTER SYSTEM / reload / superuser required). It must run before
+// ensureReplicationSlot/StartReplication switches the connection into
+// replication mode, since regular SQL is no longer accepted afterwards.
+func (r *Reader) applyLogicalDecodingWorkMem(ctx context.Context) error {
+	value := strings.TrimSpace(r.config.LogicalDecodingWorkMem)
+	if value == "" {
+		return nil
+	}
+	if !logicalDecodingWorkMemPattern.MatchString(value) {
+		return fmt.Errorf("invalid LogicalDecodingWorkMem %q: expected e.g. \"256MB\"", value)
+	}
+
+	query := fmt.Sprintf("SET logical_decoding_work_mem = '%s'", value)
+	result := r.conn.Exec(ctx, query)
+	if _, err := result.ReadAll(); err != nil {
+		return fmt.Errorf("failed to set logical_decoding_work_mem to %q: %w", value, err)
+	}
+	log.Printf("Set logical_decoding_work_mem = '%s' for this replication session", value)
 	return nil
 }
 

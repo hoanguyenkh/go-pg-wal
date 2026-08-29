@@ -44,6 +44,17 @@ type Config struct {
 	// Output plugin for logical replication (default: pgoutput)
 	OutputPlugin string
 
+	// LogicalDecodingWorkMem, when non-empty, is applied as
+	// SET logical_decoding_work_mem = '<value>' on the replication connection
+	// right after Connect(), before the slot/publication/replication setup.
+	// It is session-scoped (does not require server reload/restart or
+	// superuser) and bounds the walsender's in-memory reorder buffer for this
+	// slot; larger transactions than this spill to disk under
+	// pg_replslot/<slot>/, which is a common source of decode slowdowns.
+	// Accepts the same syntax as the GUC, e.g. "256MB", "65536kB". Empty
+	// leaves the server default (64MB) in effect.
+	LogicalDecodingWorkMem string
+
 	Schema       string
 	MapTableName map[string]bool
 }
