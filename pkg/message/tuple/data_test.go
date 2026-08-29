@@ -3,6 +3,7 @@ package tuple
 import (
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -64,7 +65,12 @@ func TestDecodeWithColumn_BinaryNumeric(t *testing.T) {
 
 	decoded, err := d.DecodeWithColumn(columns)
 	require.NoError(t, err)
-	require.Contains(t, decoded, "total_volume")
+	n, ok := decoded["total_volume"].(pgtype.Numeric)
+	require.True(t, ok, "expected pgtype.Numeric, got %T", decoded["total_volume"])
+	require.True(t, n.Valid)
+	require.NotNil(t, n.Int)
+	assert.Equal(t, "605", n.Int.String())
+	assert.Equal(t, int32(0), n.Exp)
 }
 
 func TestDecodeWithColumn_NullAndUnchangedToastOmitted(t *testing.T) {
@@ -85,4 +91,20 @@ func TestDecodeWithColumn_NullAndUnchangedToastOmitted(t *testing.T) {
 	assert.Nil(t, decoded["deleted_at"])
 	_, hasBigBlob := decoded["big_blob"]
 	assert.False(t, hasBigBlob, "unchanged TOAST column must be omitted, not zero-valued")
+}
+
+func TestDecodeWithColumn_UnknownDataTypeErrors(t *testing.T) {
+	d := &Data{
+		ColumnNumber: 1,
+		Columns: DataColumns{
+			{DataType: 'x'},
+		},
+	}
+	columns := []RelationColumn{
+		{Name: "id", DataType: 23},
+	}
+
+	_, err := d.DecodeWithColumn(columns)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown tuple data type")
 }

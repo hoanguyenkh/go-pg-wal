@@ -51,8 +51,9 @@ type Config struct {
 	// superuser) and bounds the walsender's in-memory reorder buffer for this
 	// slot; larger transactions than this spill to disk under
 	// pg_replslot/<slot>/, which is a common source of decode slowdowns.
-	// Accepts the same syntax as the GUC, e.g. "256MB", "65536kB". Empty
-	// leaves the server default (64MB) in effect.
+	// Accepts the same syntax as the GUC, e.g. "256MB", "65536kB", "1TB".
+	// Empty leaves the server's current default in effect (Postgres ships
+	// 64MB unless the instance already overrode it). Requires PG 13+.
 	LogicalDecodingWorkMem string
 
 	Schema       string

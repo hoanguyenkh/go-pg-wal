@@ -113,6 +113,8 @@ func (r *Reader) Connect(ctx context.Context) error {
 	r.conn = conn
 
 	if err := r.applyLogicalDecodingWorkMem(ctx); err != nil {
+		_ = r.conn.Close(ctx)
+		r.conn = nil
 		return err
 	}
 
@@ -137,9 +139,10 @@ func (r *Reader) Connect(ctx context.Context) error {
 }
 
 // logicalDecodingWorkMemPattern matches Postgres memory-GUC syntax, e.g.
-// "256MB", "65536kB", "1GB", or a bare integer (kB). SET is not parameterizable
-// over the simple query protocol, so the value is validated before interpolation.
-var logicalDecodingWorkMemPattern = regexp.MustCompile(`(?i)^[0-9]+\s*(kb|mb|gb)?$`)
+// "256MB", "65536kB", "1GB", "1TB", "65536B", or a bare integer (kB). SET is
+// not parameterizable over the simple query protocol used on replication
+// connections, so the value is validated before interpolation.
+var logicalDecodingWorkMemPattern = regexp.MustCompile(`(?i)^[0-9]+\s*(k?b|mb|gb|tb)?$`)
 
 // applyLogicalDecodingWorkMem sets logical_decoding_work_mem on this session
 // only (no ALTER SYSTEM / reload / superuser required). It must run before

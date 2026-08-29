@@ -90,10 +90,10 @@ func TestApplyLogicalDecodingWorkMem_RejectsInvalidValue(t *testing.T) {
 }
 
 func TestApplyLogicalDecodingWorkMem_AcceptsValidSyntax(t *testing.T) {
-	for _, value := range []string{"256MB", "65536kB", "1GB", "134217728"} {
+	for _, value := range []string{"256MB", "65536kB", "1GB", "1TB", "65536B", "134217728"} {
 		assert.True(t, logicalDecodingWorkMemPattern.MatchString(value), "expected %q to be accepted", value)
 	}
-	for _, value := range []string{"", "256 MB; --", "abc", "256MB'"} {
+	for _, value := range []string{"", "256 MB; --", "abc", "256MB'", "1PB"} {
 		assert.False(t, logicalDecodingWorkMemPattern.MatchString(value), "expected %q to be rejected", value)
 	}
 }

@@ -89,20 +89,18 @@ func (d *Data) DecodeWithColumn(columns []RelationColumn) (map[string]any, error
 			}
 			decoded[colName] = val
 		case DataTypeBinary:
-			// Only reachable when the replication connection negotiates the
-			// "binary 'true'" plugin arg (see StartReplicationOptions.PluginArgs).
-			// Without this case, binary-format columns were silently omitted
-			// from the decoded map instead of erroring, corrupting callers that
-			// index missing keys.
+			// Sent when the connection negotiates plugin arg binary 'true'.
 			val, err := decodeBinaryColumnData(col.Data, columns[idx].DataType)
 			if err != nil {
 				return nil, errors.Wrap(err, "decode column")
 			}
 			decoded[colName] = val
+		case DataTypeToast:
+			// Unchanged TOAST: Postgres sent no value. Omit the key (Debezium
+			// "omit unavailable value") rather than inserting a zero value.
+		default:
+			return nil, errors.New("unknown tuple data type: " + string(col.DataType))
 		}
-		// DataTypeToast (unchanged TOAST column) intentionally has no entry:
-		// Postgres did not send a value, so there is nothing to decode. This
-		// matches Debezium's default "omit unavailable value" semantics.
 	}
 
 	return decoded, nil
