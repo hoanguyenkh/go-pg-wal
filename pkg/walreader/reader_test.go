@@ -279,7 +279,7 @@ func TestReaderCommitAckCoversAllMessagesInTransaction(t *testing.T) {
 	assert.Equal(t, []pglogrepl.LSN{131}, stateStore.saved)
 }
 
-func TestHandleLogicalMessage_SkipDeleteBeforeTupleDecode(t *testing.T) {
+func TestHandleLogicalMessage_SkipDelete(t *testing.T) {
 	deleteMsg := []byte{68, 0, 0, 64, 6, 79, 0, 2, 116, 0, 0, 0, 3, 54, 52, 53, 116, 0, 0, 0, 3, 102, 111, 111}
 	rel := map[uint32]*format.Relation{
 		16390: {
@@ -294,16 +294,36 @@ func TestHandleLogicalMessage_SkipDeleteBeforeTupleDecode(t *testing.T) {
 		},
 	}
 
-	t.Run("SkipDelete skips listener", func(t *testing.T) {
-		var called atomic.Bool
+	t.Run("SkipDelete does not deliver Delete", func(t *testing.T) {
+		got := make(chan any, 1)
 		reader := NewReader(&Config{
 			StateStore:  &testStateStore{},
 			LSNStateKey: "slot",
 			SkipDelete:  true,
-		}, func(*ListenerContext) { called.Store(true) })
+		}, func(ctx *ListenerContext) { got <- ctx.Message })
 		reader.relations = rel
-		require.NoError(t, reader.handleLogicalMessage(context.Background(), deleteMsg, time.Now(), 120))
-		assert.False(t, called.Load())
+
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			reader.process(ctx)
+			close(done)
+		}()
+		t.Cleanup(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Error("reader process did not stop")
+			}
+		})
+
+		require.NoError(t, reader.handleLogicalMessage(ctx, deleteMsg, time.Now(), 120))
+		select {
+		case msg := <-got:
+			t.Fatalf("unexpectedly delivered skipped Delete: %T", msg)
+		case <-time.After(100 * time.Millisecond):
+		}
 	})
 
 	t.Run("delete is delivered when SkipDelete is false", func(t *testing.T) {
