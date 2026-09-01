@@ -56,6 +56,11 @@ type Config struct {
 	// 64MB unless the instance already overrode it). Requires PG 13+.
 	LogicalDecodingWorkMem string
 
+	// SkipDelete drops pgoutput Delete ('D') messages before tuple decode.
+	// The following Commit ACK still covers their LSNs. Default false so other
+	// clients keep receiving deletes; historical sets this true.
+	SkipDelete bool
+
 	Schema       string
 	MapTableName map[string]bool
 }
