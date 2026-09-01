@@ -10,6 +10,7 @@ import (
 
 	"github.com/hoanguyenkh/go-pg-wal/pkg/message"
 	"github.com/hoanguyenkh/go-pg-wal/pkg/message/format"
+	"github.com/hoanguyenkh/go-pg-wal/pkg/message/tuple"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/stretchr/testify/assert"
@@ -276,6 +277,54 @@ func TestReaderCommitAckCoversAllMessagesInTransaction(t *testing.T) {
 
 	require.NoError(t, <-ackErr)
 	assert.Equal(t, []pglogrepl.LSN{131}, stateStore.saved)
+}
+
+func TestHandleLogicalMessage_SkipDeleteBeforeTupleDecode(t *testing.T) {
+	deleteMsg := []byte{68, 0, 0, 64, 6, 79, 0, 2, 116, 0, 0, 0, 3, 54, 52, 53, 116, 0, 0, 0, 3, 102, 111, 111}
+	rel := map[uint32]*format.Relation{
+		16390: {
+			OID:           16390,
+			Namespace:     "public",
+			Name:          "t",
+			ColumnNumbers: 2,
+			Columns: []tuple.RelationColumn{
+				{Flags: 1, Name: "id", DataType: 23, TypeModifier: 4294967295},
+				{Flags: 0, Name: "name", DataType: 25, TypeModifier: 4294967295},
+			},
+		},
+	}
+
+	t.Run("SkipDelete skips listener", func(t *testing.T) {
+		var called atomic.Bool
+		reader := NewReader(&Config{
+			StateStore:  &testStateStore{},
+			LSNStateKey: "slot",
+			SkipDelete:  true,
+		}, func(*ListenerContext) { called.Store(true) })
+		reader.relations = rel
+		require.NoError(t, reader.handleLogicalMessage(context.Background(), deleteMsg, time.Now(), 120))
+		assert.False(t, called.Load())
+	})
+
+	t.Run("delete is delivered when SkipDelete is false", func(t *testing.T) {
+		got := make(chan any, 1)
+		reader := NewReader(&Config{
+			StateStore:  &testStateStore{},
+			LSNStateKey: "slot",
+		}, func(ctx *ListenerContext) { got <- ctx.Message })
+		reader.relations = rel
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go reader.process(ctx)
+		require.NoError(t, reader.handleLogicalMessage(ctx, deleteMsg, time.Now(), 120))
+		select {
+		case msg := <-got:
+			_, ok := msg.(*format.Delete)
+			assert.True(t, ok)
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for Delete")
+		}
+	})
 }
 
 func queuedTestMessage(sequence uint64, lsn pglogrepl.LSN) *queuedMessage {

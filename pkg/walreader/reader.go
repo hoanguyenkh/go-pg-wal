@@ -538,6 +538,9 @@ func (r *Reader) handleLogicalMessage(ctx context.Context, data []byte, serverTi
 	if walStart == 0 {
 		log.Printf("DEBUG: Message with WALStart=0, type=%c (0x%02x)", data[0], data[0])
 	}
+	if r.config != nil && r.config.SkipDelete && len(data) > 0 && message.Type(data[0]) == message.DeleteByte {
+		return nil
+	}
 	decodedMsg, err := message.New(data, serverTime, r.relations)
 	if err != nil {
 		// Ignore unsupported messages
